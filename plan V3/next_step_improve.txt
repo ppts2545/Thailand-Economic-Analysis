@@ -1,0 +1,15 @@
+
+🚀 8. next step (สำคัญมาก)
+
+ตอนนี้ไม่ควรเพิ่ม feature แล้วแบบสุ่ม
+
+ควรทำ:
+
+1. Feature pruning (ตัด noise)
+2. Regime split (risk-on / risk-off)
+3. Walk-forward validation แบบ strict
+4. Convert Gold → live strategy
+💬 ประโยคสำคัญที่สุด
+
+ตอนนี้คุณไม่ได้ tune model แล้ว
+คุณกำลัง “map structure ของ global financial system”

@@ -170,6 +170,23 @@ for lag in [1, 2]:
     daily_lag_dict[col] = s
     print(f'  {col:<28}  {s.notna().sum()} weeks with data')
 
+# EEM (iShares MSCI EM ETF) — direct proxy for foreign fund flows into/out of EM
+# When foreign investors sell EM (Thailand), EEM falls → leading SET signal
+try:
+    import yfinance as yf
+    eem_raw = yf.download('EEM', start='2000-01-01', progress=False, auto_adjust=True)
+    eem_close = (eem_raw['Close'].squeeze()
+                 if hasattr(eem_raw['Close'], 'squeeze') else eem_raw['Close'])
+    eem_close = eem_close.sort_index()
+    eem_close.index = pd.to_datetime(eem_close.index).tz_localize(None)
+    for lag in [1, 2]:
+        col = f'eem_ret_d_lag{lag}'
+        s = _daily_lag_at_friday(eem_close, week_idx, lag)
+        daily_lag_dict[col] = s
+        print(f'  {col:<28}  {s.notna().sum()} weeks with data')
+except Exception as e:
+    print(f'  [skip] EEM: {e}')
+
 daily_lag_w = pd.DataFrame(daily_lag_dict)
 print(f'  Total daily-lag features: {daily_lag_w.shape[1]}  shape={daily_lag_w.shape}')
 
