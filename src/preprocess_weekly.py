@@ -6,6 +6,11 @@ Extends the monthly pipeline (02_data_cleaning.ipynb) to weekly frequency:
   - Monthly FRED data     → forward-fill to W-FRI
   - Annual macro data     → broadcast to every week in that year
   - USD/THB gap 2000-2003 → filled from FRED EXTHUS monthly series
+  - Cross-market daily lag features (Step 2.5):
+      For each W-FRI, extract daily returns from N business days before.
+      Timezone logic: S&P500 closes at 4am Bangkok on Friday
+      (16:00 ET = 04:00 Bangkok +1 day), so Thursday's S&P500 return
+      is available BEFORE SET opens Friday at 09:30 → genuine leading indicator.
 
 Output: data/processed/unified_weekly.csv
   Training window (2000-09 → 2019-12) ≈ 1,000 weeks  (vs 180 monthly)
@@ -15,6 +20,7 @@ Output: data/processed/unified_weekly.csv
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -36,19 +42,28 @@ def _to_weekly_price(series: pd.Series) -> pd.Series:
 
 
 def _monthly_to_weekly(series: pd.Series, ffill_limit: int = 5) -> pd.Series:
-    """Monthly series → weekly by forward-filling each monthly value."""
-    monthly = series.resample('ME').last().ffill(limit=2)
+    """Monthly series → weekly, shifted 1 month to simulate publication lag.
+
+    e.g. January CPI is published ~mid-February, so it is only available
+    from the February W-FRI onwards — prevents look-ahead leakage.
+    """
+    monthly = series.resample('ME').last().ffill(limit=2).shift(1)  # 1-month pub lag
     week_idx = pd.date_range(monthly.index.min(), monthly.index.max(), freq=WEEK_FREQ)
     return monthly.reindex(week_idx, method='ffill').ffill(limit=ffill_limit)
 
 
 def _annual_to_weekly(df_annual: pd.DataFrame, week_idx: pd.DatetimeIndex) -> pd.DataFrame:
-    """Annual int-indexed DataFrame → broadcast each year's value to every week."""
+    """Annual int-indexed DataFrame → broadcast prior year's value to every week.
+
+    Annual figures (GDP, World Bank) are released ~1 year after the reference
+    year (e.g. 2024 GDP released March 2025), so weeks in year T see year T-1.
+    """
     out = pd.DataFrame(index=week_idx, dtype=float)
     for col in df_annual.columns:
-        mapping = {w: df_annual.loc[w.year, col]
+        mapping = {w: df_annual.loc[w.year - 1, col]
                    for w in week_idx
-                   if w.year in df_annual.index and not pd.isna(df_annual.loc[w.year, col])}
+                   if (w.year - 1) in df_annual.index
+                   and not pd.isna(df_annual.loc[w.year - 1, col])}
         out[col] = pd.Series(mapping)
     return out
 
@@ -67,7 +82,7 @@ def _winsorize(ret_df: pd.DataFrame, lo=0.01, hi=0.99) -> pd.DataFrame:
 # ── Step 1: Market prices → weekly ────────────────────────────────────────────
 
 MARKET_NAMES = ['SET_index', 'vix', 'gold', 'oil', 'sp500',
-                'us_10yr_treasury', 'nasdaq']
+                'us_10yr_treasury', 'us_2yr_treasury', 'nasdaq', 'dxy']
 
 print('Step 1: Loading daily market signals → weekly ...')
 price_dict = {}
@@ -85,13 +100,16 @@ yf_w   = _to_weekly_price(yf_raw.set_index('date')['close'].rename('USD_THB').so
 fred_thb = pd.read_csv(RAW_DIR / 'fred_usd_thb_monthly.csv', parse_dates=['date'])
 fred_thb_w = _monthly_to_weekly(fred_thb.set_index('date')['value'].rename('USD_THB').sort_index())
 
-# Merge: FRED fills 2000-2003 gap, yfinance takes over after
-usd_thb_w = fred_thb_w.combine_first(yf_w).rename('USD_THB')
+# Merge: yfinance (daily→weekly) is primary; FRED monthly fills 2000-2003 gap only
+usd_thb_w = yf_w.combine_first(fred_thb_w).rename('USD_THB')
 price_dict['USD_THB'] = usd_thb_w
 print(f'  {"USD_THB (combined)":<22} {usd_thb_w.index[0].date()} → '
       f'{usd_thb_w.index[-1].date()}  ({len(usd_thb_w)} weeks)')
 
 market_price_w = pd.concat(price_dict, axis=1).sort_index()
+
+# Build common weekly index early — needed for Steps 2.5 and 5
+week_idx = pd.date_range(start=CLIP_START, end=CLIP_END, freq=WEEK_FREQ)
 
 
 # ── Step 2: Weekly returns + winsorize ────────────────────────────────────────
@@ -101,6 +119,59 @@ market_ret_w = _winsorize(market_price_w.pct_change())
 market_ret_w.columns = [f'{c}_ret_w' for c in market_ret_w.columns]
 market_price_w.columns = [f'{c}_price' for c in market_price_w.columns]
 print(f'  Ret shape: {market_ret_w.shape}   Price shape: {market_price_w.shape}')
+
+
+# ── Step 2.5: Cross-market daily lag features ────────────────────────────────
+# For each W-FRI date: extract the daily return from N business days before.
+#
+# Rationale (timezone lead effect):
+#   S&P500 Thu close  = 16:00 ET = 04:00 Bangkok Fri → arrives BEFORE SET Fri open (09:30)
+#   S&P500 Wed close  = 16:00 ET = 04:00 Bangkok Thu → available before SET Fri close (16:30)
+#   → lag 1 bday = Thursday US return = genuine pre-open signal for SET Friday
+#   → lag 2 bday = Wednesday US return = additional confirmation
+#
+# These are NOT leaky: S&P500 close on Thursday arrives in Bangkok early Friday morning,
+# well before the Thai stock exchange closes on Friday afternoon.
+
+def _daily_lag_at_friday(close_series: pd.Series, week_idx, lag_bdays: int) -> pd.Series:
+    """Return daily return N business days before each W-FRI date."""
+    daily_ret = close_series.sort_index().pct_change()
+    result = {}
+    for friday in week_idx:
+        target = pd.Timestamp(friday) - BDay(lag_bdays)
+        avail  = daily_ret.index[daily_ret.index <= target]
+        if len(avail) and (target - avail[-1]).days <= 4:  # allow up to 4-day gap (holidays)
+            result[friday] = daily_ret[avail[-1]]
+    return pd.Series(result, dtype=float)
+
+
+# Assets to compute daily lags for (all have existing daily CSVs)
+DAILY_LAG_ASSETS = ['sp500', 'nasdaq', 'oil', 'dxy']
+
+print('\nStep 2.5: Cross-market daily lag features (timezone lead effect) ...')
+daily_lag_dict = {}
+
+for asset in DAILY_LAG_ASSETS:
+    raw = pd.read_csv(RAW_DIR / f'{asset}_market_signals.csv', parse_dates=['date'])
+    close = raw.set_index('date')['close'].sort_index()
+    for lag in [1, 2]:
+        col = f'{asset}_ret_d_lag{lag}'
+        s = _daily_lag_at_friday(close, week_idx, lag)
+        daily_lag_dict[col] = s
+        n_valid = s.notna().sum()
+        print(f'  {col:<28}  {n_valid} weeks with data  '
+              f'(range {s.dropna().index[0].date()} → {s.dropna().index[-1].date()})')
+
+# USD/THB daily lag — use yfinance daily data (already loaded above)
+yf_close = yf_raw.set_index('date')['close'].sort_index()
+for lag in [1, 2]:
+    col = f'USD_THB_ret_d_lag{lag}'
+    s = _daily_lag_at_friday(yf_close, week_idx, lag)
+    daily_lag_dict[col] = s
+    print(f'  {col:<28}  {s.notna().sum()} weeks with data')
+
+daily_lag_w = pd.DataFrame(daily_lag_dict)
+print(f'  Total daily-lag features: {daily_lag_w.shape[1]}  shape={daily_lag_w.shape}')
 
 
 # ── Step 3: FRED monthly → weekly ─────────────────────────────────────────────
@@ -158,15 +229,13 @@ print(f'  Annual macro: {macro.shape}  years {int(macro.index.min())}–{int(mac
 
 print('\nStep 5: Merging all sources ...')
 
-# Build common weekly index
-week_idx = pd.date_range(start=CLIP_START, end=CLIP_END, freq=WEEK_FREQ)
-
 macro_w = _annual_to_weekly(macro, week_idx)
 macro_w.columns = [f'{c}_annual' for c in macro_w.columns]
 
 unified_w = (
     market_ret_w
     .join(market_price_w, how='outer')
+    .join(daily_lag_w,    how='outer')   # cross-market daily lags
     .join(fred_w,         how='outer')
     .join(macro_w,        how='outer')
     .sort_index()

@@ -192,60 +192,264 @@ MARKET_TICKERS = {
     'oil':              'CL=F',     # Crude oil (global growth / supply chain)
     # Interest rate (factor 2)
     'us_10yr_treasury': '^TNX',     # US 10-yr yield — global rate benchmark
+    'us_2yr_treasury':  '^IRX',     # US 13-week T-Bill (short end) — yield curve
     # Technology / innovation (factor 8)
     'nasdaq':           '^IXIC',    # Nasdaq — tech sector performance
+    # USD strength — driver of Gold (inverse) and USD/THB (direct)
+    'dxy':              'DX-Y.NYB', # US Dollar Index (basket of 6 currencies)
 }
 
 def fetch_market_signals(tickers: dict = MARKET_TICKERS, start: str = DATA_START):
     """
-    Fetch closing price history for each market ticker from `start` date to today.
-    Returns a dict of {name: polars DataFrame with date and close columns}.
+    Fetch OHLCV history for each market ticker from `start` date to today.
+    Returns a dict of {name: polars DataFrame with date, open, high, low, close, volume}.
     """
     result = {}
     for name, symbol in tickers.items():
         try:
             df_pd = yf.download(symbol, start=start, progress=False, auto_adjust=True)
             if not df_pd.empty:
-                df_pd = df_pd[['Close']].reset_index()
-                df_pd.columns = ['date', 'close']
-                result[name] = pl.DataFrame({
-                    'date':  df_pd['date'].dt.strftime('%Y-%m-%d').tolist(),
-                    'close': df_pd['close'].astype(float).tolist(),
-                })
+                # Flatten MultiIndex columns if present (yfinance ≥ 0.2.x)
+                if df_pd.columns.nlevels > 1:
+                    df_pd.columns = [c[0].lower() for c in df_pd.columns]
+                else:
+                    df_pd.columns = [c.lower() for c in df_pd.columns]
+                df_pd = df_pd.reset_index()
+                df_pd.rename(columns={'date': 'date', 'index': 'date'}, inplace=True)
+                df_pd['date'] = df_pd['date'].dt.strftime('%Y-%m-%d')
+
+                cols = {'date': df_pd['date'].tolist(),
+                        'close': df_pd['close'].astype(float).tolist()}
+                for col in ['open', 'high', 'low', 'volume']:
+                    if col in df_pd.columns:
+                        cols[col] = df_pd[col].astype(float).tolist()
+                result[name] = pl.DataFrame(cols)
         except Exception as e:
             print(f"[Skip] {name}: {e}")
     return result
 
 
 # --- SECTION 5: NEWS SENTIMENT (Bangkok Post RSS) ---
-# Parse English economic headlines and score sentiment with VADER.
-# Negative sentiment in business news often precedes economic deterioration.
+# Quant-grade weighted sentiment model:
+#   score = VADER_compound × importance × (1 + power_bonus)
+# where:
+#   importance = max keyword weight found in headline (default 1.0)
+#   power_bonus = count of high-impact keywords / 3 (capped at 1.0)
+# Credibility is uniform (Bangkok Post RSS = authoritative source = 1.0).
+# Recency decay is applied at aggregation time (in the notebook), not here.
 
 BANGKOK_POST_RSS = {
     'business': 'https://www.bangkokpost.com/rss/data/business.xml',
     'economy':  'https://www.bangkokpost.com/rss/data/economy.xml',
 }
 
+# Keyword importance map:  word/phrase → importance multiplier
+# Sources: Tetlock (2007), Loughran & McDonald (2011), empirical hedge fund practice
+IMPORTANCE_MAP = {
+    # Central bank & rates — highest market impact
+    'federal reserve': 2.0, 'fed ': 2.0, 'rate hike': 2.0, 'rate cut': 2.0,
+    'interest rate': 1.8, 'monetary policy': 1.8, 'bank of thailand': 1.8,
+    'quantitative easing': 1.8, 'taper': 1.7, 'pivot': 1.7,
+    # Macro shock events
+    'recession': 2.0, 'default': 2.0, 'crisis': 1.8, 'emergency': 1.8,
+    'collapse': 2.0, 'crash': 2.0, 'panic': 1.7, 'systemic': 1.8,
+    # Directional price words (Loughran & McDonald power words)
+    'surge': 1.4, 'soar': 1.4, 'plunge': 1.5, 'tumble': 1.5,
+    'selloff': 1.5, 'rally': 1.3, 'record high': 1.4, 'record low': 1.4,
+    'all-time': 1.3,
+    # Trade & geopolitics
+    'trade war': 1.8, 'tariff': 1.5, 'sanction': 1.8, 'war': 1.7,
+    'inflation': 1.5, 'deflation': 1.5, 'stagflation': 1.8,
+    # Thailand-specific macro
+    'baht': 1.4, 'set index': 1.3, 'gdp': 1.3, 'export': 1.2, 'current account': 1.3,
+    # Diminished credibility words → reduce weight
+    'rumor': 0.5, 'unconfirmed': 0.5, 'speculation': 0.6, 'reportedly': 0.7,
+}
+
+
+def _article_importance(text: str) -> tuple[float, int]:
+    """Return (max_importance, power_word_count) for a piece of text."""
+    t = text.lower()
+    max_imp   = 1.0
+    pw_count  = 0
+    for word, imp in IMPORTANCE_MAP.items():
+        if word in t:
+            if imp > 1.0:
+                pw_count += 1
+            max_imp = max(max_imp, imp)
+    return max_imp, pw_count
+
+
 def fetch_news_sentiment(feeds: dict = BANGKOK_POST_RSS):
     """
-    Fetch latest headlines from Bangkok Post RSS and score each with VADER sentiment.
-    Returns a polars DataFrame: title, published, compound, sentiment, feed.
-    compound score: -1 (very negative) to +1 (very positive)
+    Fetch latest headlines from Bangkok Post RSS and score with weighted VADER sentiment.
+
+    Columns returned:
+      title, published, compound       — raw VADER score
+      importance                        — keyword importance multiplier (1.0–2.0)
+      power_word_count                  — number of high-impact keywords found
+      weighted_compound                 — compound × importance × (1 + min(pw_count/3, 1))
+      sentiment                         — positive / negative / neutral (from weighted score)
+      feed                              — source feed name
     """
     analyzer = SentimentIntensityAnalyzer()
     rows = []
     for feed_name, url in feeds.items():
         parsed = feedparser.parse(url)
         for entry in parsed.entries:
-            score = analyzer.polarity_scores(entry.title)['compound']
+            raw_compound = analyzer.polarity_scores(entry.title)['compound']
+            importance, pw_count = _article_importance(entry.title)
+            power_bonus  = min(pw_count / 3.0, 1.0)          # cap bonus at 1× extra
+            weighted     = raw_compound * importance * (1.0 + power_bonus)
+            weighted     = max(-1.0, min(1.0, weighted))       # clamp to [-1, 1]
             rows.append({
-                'title':     entry.title,
-                'published': entry.get('published', ''),
-                'compound':  score,
-                'sentiment': 'positive' if score > 0.05 else ('negative' if score < -0.05 else 'neutral'),
-                'feed':      feed_name,
+                'title':            entry.title,
+                'published':        entry.get('published', ''),
+                'compound':         round(raw_compound, 4),
+                'importance':       round(importance, 2),
+                'power_word_count': pw_count,
+                'weighted_compound': round(weighted, 4),
+                'sentiment': ('positive' if weighted > 0.05
+                              else ('negative' if weighted < -0.05 else 'neutral')),
+                'feed': feed_name,
             })
     return pl.DataFrame(rows)
+
+
+# --- SECTION 5b: GDELT DOC API v2 — Historical Thailand Financial News ---
+# Free, no key needed. Coverage: ~2015-present (earlier data sparse).
+# DOC API returns article metadata: url, title, seendate, domain, language, tone.
+# We apply the same weighted VADER pipeline as Bangkok Post.
+
+GDELT_DOC_URL = 'https://api.gdeltproject.org/api/v2/doc/doc'
+
+GDELT_QUERIES = [
+    'Thailand economy GDP growth',
+    'Thailand SET index stock market',
+    'Thailand baht currency exchange rate',
+    'Bank of Thailand interest rate monetary policy',
+    'Thailand inflation exports trade',
+    'Thailand financial crisis recession',
+    'Federal Reserve rate hike cut Thailand',
+    'gold price oil price Thailand',
+]
+
+
+def fetch_gdelt_news(
+    start_year: int = 2015,
+    end_year:   int = 2025,
+    max_per_chunk: int = 250,
+    delay: float = 1.5,
+) -> pl.DataFrame:
+    """
+    Fetch Thailand financial news from GDELT DOC API v2.
+
+    Iterates quarterly date chunks × GDELT_QUERIES, applies weighted VADER scoring,
+    deduplicates by URL, and returns a DataFrame with the same schema as
+    fetch_news_sentiment() plus a 'source' column = 'gdelt'.
+
+    Columns: title, published, compound, importance, power_word_count,
+             weighted_compound, sentiment, feed, source
+    """
+    analyzer = SentimentIntensityAnalyzer()
+    seen_urls: set = set()
+    rows: list[dict] = []
+
+    # Build quarterly date windows
+    quarters = []
+    for year in range(start_year, end_year + 1):
+        for q_start_month, q_end_month in [(1,3), (4,6), (7,9), (10,12)]:
+            import datetime
+            qs = datetime.date(year, q_start_month, 1)
+            # Last day of end month
+            if q_end_month == 12:
+                qe = datetime.date(year, 12, 31)
+            else:
+                qe = datetime.date(year, q_end_month + 1, 1) - datetime.timedelta(days=1)
+            if qe > datetime.date.today():
+                qe = datetime.date.today()
+            if qs >= qe:
+                break
+            quarters.append((qs, qe))
+
+    total = len(quarters) * len(GDELT_QUERIES)
+    done  = 0
+    for qs, qe in quarters:
+        start_dt = qs.strftime('%Y%m%d') + '000000'
+        end_dt   = qe.strftime('%Y%m%d') + '235959'
+
+        for query in GDELT_QUERIES:
+            done += 1
+            params = {
+                'query':         query,
+                'mode':          'artlist',
+                'format':        'json',
+                'startdatetime': start_dt,
+                'enddatetime':   end_dt,
+                'maxrecords':    max_per_chunk,
+                'sourcelang':    'english',
+            }
+            try:
+                resp = req_lib.get(GDELT_DOC_URL, params=params,
+                                   headers=BROWSER_HEADERS, timeout=20)
+                if resp.status_code != 200:
+                    time.sleep(delay)
+                    continue
+                data = resp.json()
+                articles = data.get('articles', []) or []
+                for art in articles:
+                    url   = art.get('url', '')
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    title = art.get('title', '') or ''
+                    # Skip non-English titles (< 60% printable ASCII)
+                    if title and sum(ord(c) < 128 for c in title) / len(title) < 0.60:
+                        continue
+                    seendate = art.get('seendate', '')  # e.g. '20230415T120000Z'
+                    # Parse to ISO date string
+                    try:
+                        pub_dt = seendate[:8]  # YYYYMMDD
+                        published = f"{pub_dt[:4]}-{pub_dt[4:6]}-{pub_dt[6:8]}"
+                    except Exception:
+                        published = ''
+
+                    raw_compound = analyzer.polarity_scores(title)['compound']
+                    importance, pw_count = _article_importance(title)
+                    power_bonus = min(pw_count / 3.0, 1.0)
+                    weighted    = raw_compound * importance * (1.0 + power_bonus)
+                    weighted    = max(-1.0, min(1.0, weighted))
+
+                    rows.append({
+                        'title':             title,
+                        'published':         published,
+                        'compound':          round(raw_compound, 4),
+                        'importance':        round(importance, 2),
+                        'power_word_count':  pw_count,
+                        'weighted_compound': round(weighted, 4),
+                        'sentiment': ('positive' if weighted >  0.05
+                                      else ('negative' if weighted < -0.05
+                                            else 'neutral')),
+                        'feed':   query[:40],
+                        'source': 'gdelt',
+                    })
+            except Exception as e:
+                print(f"  [GDELT warn] {qs}→{qe} | {query[:30]}: {e}")
+
+            if done % 20 == 0:
+                print(f"  GDELT progress: {done}/{total} chunks | "
+                      f"{len(rows)} articles ({len(seen_urls)} unique)")
+            time.sleep(delay + random.uniform(0, 0.5))
+
+    print(f"  GDELT done: {len(rows)} scored articles from {len(seen_urls)} unique URLs")
+    if not rows:
+        return pl.DataFrame(schema={
+            'title': pl.Utf8, 'published': pl.Utf8, 'compound': pl.Float64,
+            'importance': pl.Float64, 'power_word_count': pl.Int64,
+            'weighted_compound': pl.Float64, 'sentiment': pl.Utf8,
+            'feed': pl.Utf8, 'source': pl.Utf8,
+        })
+    return pl.DataFrame(rows).sort('published')
 
 
 # --- SECTION 6: IMF API — Monetary Policy Indicators ---
@@ -325,6 +529,15 @@ if __name__ == "__main__":
 
     run_and_save('News Sentiment (Bangkok Post)', 'news_sentiment.csv',
                  fetch_news_sentiment)
+
+    print("\n=== GDELT Historical News (2015→2025) ===")
+    try:
+        gdelt_df = fetch_gdelt_news(start_year=2015, end_year=2025)
+        gdelt_df.write_csv(os.path.join(DATA_DIR, 'news_gdelt.csv'))
+        print(f"Saved {len(gdelt_df)} rows → news_gdelt.csv")
+        print(gdelt_df.head(5))
+    except Exception as e:
+        print(f"[SKIP] GDELT: {e}")
 
     run_and_save('IMF GDP Growth (Thailand)', 'imf_gdp_growth_TH.csv',
                  fetch_imf, 'gdp_growth', country='TH')
