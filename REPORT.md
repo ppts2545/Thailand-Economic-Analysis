@@ -9,11 +9,14 @@ This project systematically searched for exploitable alpha in the Thai Stock Exc
 
 **Key finding:** A single global signal — the EEM (Emerging Markets ETF) weekly return lag — is the most consistent predictor of SET returns. IC = +0.11, statistically significant (p < 0.05), stable across the full 2000–2025 period.
 
+**Final system (NB20):** EEM L/flat + Gold diversifier + Risk Parity + Volatility Targeting + Drawdown Control achieves **net Sharpe +0.78, MaxDD −19%, Calmar 0.54** vs SET B&H (Sharpe +0.19, MaxDD −48%).
+
 **Bottom line:**
 - Complex ML models (XGBoost, LASSO) add marginal value over this simple signal
 - News NLP is promising in recent years (2020+) but data is too sparse to be conclusive
 - Sector rotation has real IC but is destroyed by transaction costs at weekly frequency
-- A simple EEM-lag rule-based strategy is the most practical implementation
+- Portfolio construction (risk parity + vol targeting) is the most impactful enhancement — reduces MaxDD from −28% to −19%
+- Break-even TC for the full system: ~0.30% one-way
 
 ---
 
@@ -133,6 +136,45 @@ The simplest viable strategy: **sign(eem_ret_d_lag1) determines SET position eac
 
 ---
 
+## 4b. Full System Construction — NB20
+
+*Full analysis in NB20.*
+
+Four-layer systematic portfolio combining all proven components:
+
+| Layer | Mechanism | Key Parameter |
+|-------|-----------|---------------|
+| L1 — Signal | EEM L/flat on SET; Gold always long | eem_ret_d_lag1 > 0 |
+| L2 — Risk Parity | 1/vol weights (52-wk rolling), monthly rebalance | Gold gets ~2× weight vs SET |
+| L3 — Vol Targeting | Scale to 10% annual target vol (cap 2×) | 12-wk rolling vol |
+| L4 — DD Control | Halve exposure when DD < −15%; restore at −10% | Circuit-breaker |
+
+### Performance vs Benchmarks (2004–2025, net of 0.1% TC)
+
+| Strategy | Net Sharpe | Ann Return | Max DD | Calmar |
+|----------|-----------|------------|--------|--------|
+| SET Buy & Hold | +0.186 | +5.0% | −47.7% | 0.11 |
+| EEM L/flat (NB16) | +0.564 | +8.2% | −42.2% | 0.19 |
+| EEM L/flat + Gold 50/50 (NB18) | +0.814 | +10.3% | −27.9% | 0.37 |
+| **Full System (NB20)** | **+0.778** | **+10.4%** | **−19.1%** | **0.54** |
+
+### Layer Isolation (what each layer adds)
+
+| System | Sharpe | Max DD |
+|--------|--------|--------|
+| L1 (Signal + Gold) | +0.820 | −27.9% |
+| L1 + L2 (Risk Parity) | +0.835 | −28.2% |
+| L1 + L2 + L3 (Vol Targeting) | **+0.874** | **−20.1%** |
+| L1 + L2 + L3 + L4 (DD Control) | +0.778 | −19.1% |
+
+**Key finding:** Vol targeting (L3) is the single most impactful layer — reduces MaxDD from −28% to −20% while improving Sharpe. Drawdown control (L4) costs ~0.1 Sharpe (TC drag from position changes) but shaves a further 1pp off MaxDD.
+
+**Break-even TC:** Full system survives up to ~0.30% one-way.  
+**Calmar improvement:** 0.54 vs 0.37 (EEM+Gold) — 46% better risk-adjusted return per unit drawdown.  
+**Regime stability:** Positive Sharpe in all sub-periods (2004–2009: 0.91, 2010–2014: 0.77, 2015–2019: 0.57, 2020–2025: 0.82).
+
+---
+
 ## 5. Key Lessons & Limitations
 
 ### What we learned
@@ -160,9 +202,9 @@ The simplest viable strategy: **sign(eem_ret_d_lag1) determines SET position eac
 |----------|--------|-----------------|
 | High | Collect more NLP data (Bangkok Post, Reuters API, 2015–2025) | Close the data gap; validate +3.6% DirAcc at scale |
 | High | Monthly-horizon model (aggregate to 4-week returns) | Higher SNR; EEM signal may reach IC > 0.15 |
-| Medium | EEM signal combined with sector rotation | L/flat sector tilt on EEM-positive weeks |
-| Medium | Regime-conditional strategy (bull/crisis-aware) | EEM signal stronger in normal regime (NB16) |
-| Low | Multi-asset extension (Gold, USD/THB) | NLP showed +0.20 Sharpe on Gold |
+| Medium | Add Gold directional signal (yield_curve_slope) to NB20 system | L3 vol-targeted Gold + signal could lift Sharpe > 0.90 |
+| Medium | Live paper-trading pilot | Validate EEM signal stability post-2025 |
+| Low | Stock-level monthly momentum (NB19 follow-up) | Monthly reduces TC from 41% → ~10%/yr |
 
 ---
 
@@ -182,6 +224,10 @@ The simplest viable strategy: **sign(eem_ret_d_lag1) determines SET position eac
 | eda/14 | Sector NLP | Sector-specific news sentiment |
 | eda/15 | Low-TC sector | Monthly & long-only sector rotation variants |
 | **eda/16** | **EEM signal** | **Primary deliverable: EEM lag strategy** |
+| eda/17 | EEM + sector tilt | EEM L/flat combined with sector momentum |
+| eda/18 | Gold & FX signals | IC grid, multi-asset portfolio (SET+Gold+FX) |
+| eda/19 | Stock cross-section | 54-stock momentum IC, weekly L/S (TC kills it) |
+| **eda/20** | **System construction** | **Full system: risk parity + vol target + DD control** |
 | model/01–06 | Models | OLS, LASSO, XGBoost, NLP-enhanced |
 
 ---
@@ -203,4 +249,4 @@ Walk-forward CV uses expanding training windows with no future data leakage.
 ---
 
 *Research period: 2000–2025 | Language: Python 3.13 | Key libraries: XGBoost, pandas, scipy, VADER*  
-*Author: poommy | Last updated: 2026-05-23*
+*Author: poommy | Last updated: 2026-05-23 | NB20 added: Full system construction*
