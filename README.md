@@ -1,36 +1,70 @@
-# Thailand Economic Analysis — Global Comparison
+# Thai Equity Market Alpha Research
 
 <p align="center">
-  <img src="https://flagcdn.com/w160/th.png" alt="Thailand" width="80"/>
-  &nbsp;&nbsp;
-  <img src="https://flagcdn.com/w160/us.png" alt="United States" width="80"/>
-  &nbsp;&nbsp;
-  <img src="https://flagcdn.com/w160/cn.png" alt="China" width="80"/>
-  &nbsp;&nbsp;
-  <img src="https://flagcdn.com/w160/jp.png" alt="Japan" width="80"/>
-  &nbsp;&nbsp;
-  <img src="https://flagcdn.com/w160/de.png" alt="Germany" width="80"/>
-  &nbsp;&nbsp;
-  <img src="https://flagcdn.com/w160/sg.png" alt="Singapore" width="80"/>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" />
-  <img src="https://img.shields.io/badge/Polars-DataFrame-CD792C?logo=polars&logoColor=white" />
-  <img src="https://img.shields.io/badge/World%20Bank-API-009FDA" />
-  <img src="https://img.shields.io/badge/IMF-DataMapper-003087" />
-  <img src="https://img.shields.io/badge/FRED-St.Louis%20Fed-E31837" />
-  <img src="https://img.shields.io/badge/yfinance-Markets-000000?logo=yahoo&logoColor=purple" />
+  <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" />
+  <img src="https://img.shields.io/badge/XGBoost-ML-FF6600" />
+  <img src="https://img.shields.io/badge/NLP-VADER_Sentiment-4CAF50" />
+  <img src="https://img.shields.io/badge/Data-2000--2025-1976D2" />
   <img src="https://img.shields.io/badge/Status-Active-brightgreen" />
 </p>
+
+Systematic search for predictable returns in the SET index using 25 years of weekly data, XGBoost, and NLP sentiment signals from Thai financial news.
+
+---
+
+## Key Finding
+
+> **EEM lag signal**: EEM's most recent weekly return predicts SET returns the following week.
+> IC = +0.11 · p = 0.0002 · stable in 78.7% of 52-week rolling windows (2003–2025)
+
+A rule-based strategy — *long SET when EEM was positive last week, flat otherwise* — achieves **Sharpe +0.58** after 0.1% transaction costs, beating buy-and-hold (Sharpe +0.39) with smaller drawdown (−38% vs −48%).
+
+## Results at a Glance
+
+| Strategy | Sharpe (net TC) | Ann Return | Max DD |
+|---|---|---|---|
+| **EEM Rule L/flat** *(recommended)* | **+0.58** | +7.2% | −38% |
+| EEM Rule L/S | +0.40 | +6.6% | −38% |
+| EEM + Sector Tilt | *see NB17* | — | — |
+| Sector Long-Only Monthly | +0.69 | +15.1% | −64% |
+| SET Buy & Hold | +0.39 | +6.6% | −48% |
+
+→ Full methodology and findings: [REPORT.md](REPORT.md)
+
+---
+
+## What Was Tested
+
+```
+Market-level prediction  →  XGBoost on 53 features (IC p=0.033, ICIR=1.47)
+NLP sentiment            →  +3.6% DirAcc on SET, +0.38 Sharpe uplift
+Sector rotation L/S      →  Real IC (p=0.034) but TC-negative at weekly frequency
+Low-TC sector variants   →  Long-only monthly viable (Sharpe +0.69)
+EEM lag signal           →  10/10 scorecard — strongest signal in the project
+EEM + sector tilt        →  Global signal + sector momentum combined (NB17)
+```
+
+## Notebooks
+
+| # | Notebook | Key Result |
+|---|---|---|
+| eda/06 | [Stable Alpha Research](notebooks/eda/06_stable_alpha_research.ipynb) | EEM lag IC=0.11 confirmed |
+| eda/07 | [Leakage Audit](notebooks/eda/07_leakage_audit_pipeline.ipynb) | Clean dataset (1,322×72) |
+| eda/08 | [Alpha Validation](notebooks/eda/08_alpha_validation.ipynb) | XGB-Pruned IC p=0.018 |
+| eda/09 | [Signal Robustness](notebooks/eda/09_signal_robustness.ipynb) | Permutation tests, 11 features |
+| eda/10–12 | [Backtests](notebooks/eda/10_backtest.ipynb) | Walk-forward PnL, L/S, multi-target |
+| eda/13 | [Sector Alpha](notebooks/eda/13_sector_alpha.ipynb) | IC significant, TC kills L/S |
+| eda/15 | [Low-TC Sector](notebooks/eda/15_low_tc_sector.ipynb) | B2 long-only Sharpe +0.69 |
+| **eda/16** | [**EEM Signal**](notebooks/eda/16_eem_signal.ipynb) | **Score 10/10, Sharpe +0.58** |
+| eda/17 | [EEM + Sector Tilt](notebooks/eda/17_eem_sector_tilt.ipynb) | Combined strategy |
 
 ---
 
 ## Project Goal
 
-Thailand is often analyzed in isolation, which misses the bigger picture. This project takes a **comparative, multi-country approach** — placing Thailand alongside **major Asian economies, European powerhouses, and global benchmarks** to answer a core question:
+Thailand is often analyzed in isolation, which misses the bigger picture. This project takes a **quantitative, data-driven approach** — combining global macro signals, ML models, and NLP sentiment to answer:
 
-> **How does Thailand's economic health compare to its regional peers and global leaders, and what structural factors explain the gaps?**
+> **Are there exploitable, statistically significant patterns in SET returns that survive transaction costs?**
 
 ### Countries Under Analysis
 

@@ -119,16 +119,17 @@ The simplest viable strategy: **sign(eem_ret_d_lag1) determines SET position eac
 
 | Variant | Gross Sharpe | Net Sharpe | Ann Return | Max DD | Score |
 |---------|-------------|------------|------------|--------|-------|
-| **Rule L/flat** | **+0.81** | **+0.58** | **+7.2%** | -38% | **10/10** |
-| Rule L/S | +0.73 | +0.40 | +6.6% | -38% | 10/10 |
-| Magnitude-scaled | +0.46 | +0.38 | +3.4% | -23% | — |
+| **A: EEM L/flat + sector tilt** *(NB17)* | **+1.13** | **+0.62** | **+9.7%** | -40% | **7/8** |
+| Rule L/flat (NB16) | +0.81 | +0.58 | +7.2% | -38% | 10/10 |
+| Rule L/S (NB16) | +0.73 | +0.40 | +6.6% | -38% | 10/10 |
 | 1-Feature XGB | — | +0.08 | +1.3% | — | — |
 | SET Buy & Hold | +0.39 | +0.39 | +6.6% | -48% | — |
 
+**Combination adds value:** EEM L/flat + sector momentum tilt improves Sharpe from +0.58 to +0.62 and return from +7.2% to +9.7% with manageable TC (~7%/yr).  
 **Rule beats ML:** 1-feature XGB Sharpe = +0.08 vs rule Sharpe = +0.40. Occam's razor wins.  
-**Break-even TC:** L/S survives up to ~0.30% one-way; L/flat survives up to ~0.50% one-way.
+**Break-even TC:** L/flat survives up to ~0.50% one-way.
 
-**Why simple beats complex:** With IC = 0.11, the signal is informative but the relationship is linear. XGBoost on a single feature with 1,300 training points tends to overfit the tails. The rule-based approach captures the full IC without variance from model estimation.
+**Why simple beats complex:** With IC = 0.11, the signal is linear and robust. XGBoost on a single feature with 1,300 training points overfits the tails. The rule-based approach captures the full IC without estimation variance.
 
 ---
 
