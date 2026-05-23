@@ -1,0 +1,420 @@
+"""
+gen_nb19_stock_cross_section.py -- generate notebooks/eda/19_stock_cross_section.ipynb
+
+Option 3: Stock-level cross-sectional momentum strategy.
+Individual SET stocks → cross-sectional ranking by momentum → L/S portfolio.
+
+Approach (momentum-only, no financial data needed):
+  - Features: 1w, 4w, 12w, 26w lagged returns + realized vol
+  - Composite momentum score (equal-weight of standardised ranks)
+  - Walk-forward L/S: long top-5, short bottom-5
+  - Sector-neutral variant: long/short within each sector
+  - Benchmarks: SET index, equal-weight all stocks
+"""
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).parent.parent
+OUT  = ROOT / 'notebooks' / 'eda' / '19_stock_cross_section.ipynb'
+
+def md(s): return {"cell_type": "markdown", "metadata": {}, "source": s}
+def code(s):
+    return {"cell_type": "code", "execution_count": None,
+            "metadata": {}, "outputs": [], "source": s}
+
+cells = []
+
+cells.append(md(
+    "# Notebook 19 — Stock-Level Cross-Sectional Momentum\n\n"
+    "> *Can momentum factors applied to individual SET stocks generate alpha beyond the index?*\n\n"
+    "**Approach:** Momentum-only (price data only — no financial statements needed).  \n"
+    "Long top-N stocks by composite momentum, short bottom-N.  \n"
+    "Walk-forward validation: expanding train, 52-week test folds.\n\n"
+    "| Section | Content |\n"
+    "|---|---|\n"
+    "| 1. Data | Load SET stock weekly returns |\n"
+    "| 2. Coverage | Data quality, available history per stock |\n"
+    "| 3. Features | Momentum factors (1w, 4w, 12w, 26w, vol) |\n"
+    "| 4. IC Analysis | Which momentum horizon works best? |\n"
+    "| 5. Walk-Forward L/S | Top-5 long, bottom-5 short |\n"
+    "| 6. Sector-Neutral | Constrain long/short within sectors |\n"
+    "| 7. EEM-Gated | Only run momentum when EEM+ |\n"
+    "| 8. Verdict | Score vs sector and market-level strategies |"
+))
+
+cells.append(md("---\n## Section 1 — Data Loading"))
+
+cells.append(code(
+    "from pathlib import Path\n"
+    "import warnings\n"
+    "import numpy as np\n"
+    "import pandas as pd\n"
+    "import matplotlib.pyplot as plt\n"
+    "from scipy.stats import spearmanr, ttest_1samp\n"
+    "warnings.filterwarnings('ignore')\n"
+    "np.random.seed(42)\n\n"
+    "ROOT = Path('../..')\n"
+    "PROC = ROOT / 'data' / 'processed'\n"
+    "FIGS = Path('figs')\n"
+    "FIGS.mkdir(exist_ok=True)\n\n"
+    "plt.rcParams.update({'figure.dpi':110,'axes.spines.top':False,'axes.spines.right':False,'font.size':10})\n\n"
+    "TC     = 0.001   # 0.1% one-way\n"
+    "LONG_N = 5\n"
+    "SHORT_N= 5\n\n"
+    "# ── Stock returns ──\n"
+    "stocks = pd.read_csv(PROC / 'set_stocks_weekly.csv', index_col=0, parse_dates=True)\n"
+    "stocks.index = stocks.index.normalize()\n"
+    "stocks = stocks.sort_index()\n\n"
+    "# ── Market data (for EEM gate and SET benchmark) ──\n"
+    "macro = pd.read_csv(PROC / 'unified_weekly_clean.csv', index_col=0, parse_dates=True)\n"
+    "macro.index = macro.index.normalize()\n"
+    "if 'SET_index_ret_w_fwd1' not in macro.columns:\n"
+    "    macro['SET_index_ret_w_fwd1'] = macro['SET_index_ret_w'].shift(-1)\n\n"
+    "print(f'Stocks: {stocks.shape[1]} tickers x {stocks.shape[0]} weeks')\n"
+    "print(f'Date range: {stocks.index[0].date()} -> {stocks.index[-1].date()}')\n"
+    "print(f'Macro: {macro.shape}')"
+))
+
+cells.append(md("---\n## Section 2 — Coverage & Data Quality"))
+
+cells.append(code(
+    "# Coverage per stock\n"
+    "cov = stocks.notna().mean().sort_values(ascending=False)\n"
+    "first_date = stocks.apply(lambda c: c.dropna().index[0] if c.notna().any() else pd.NaT)\n\n"
+    "fig, axes = plt.subplots(1, 2, figsize=(14, 5))\n"
+    "cov.plot(kind='bar', ax=axes[0], color='#1976D2', alpha=0.8)\n"
+    "axes[0].axhline(0.8, color='red', lw=1, ls='--', label='80% threshold')\n"
+    "axes[0].set_title('Data Coverage by Stock (fraction of weeks)')\n"
+    "axes[0].set_ylabel('Coverage')\n"
+    "axes[0].legend()\n"
+    "axes[0].tick_params(axis='x', rotation=90)\n\n"
+    "# Number of stocks available over time\n"
+    "n_stocks = stocks.notna().sum(axis=1)\n"
+    "n_stocks.plot(ax=axes[1], color='#1976D2', lw=1.5)\n"
+    "axes[1].set_title('Number of Stocks Available Each Week')\n"
+    "axes[1].set_ylabel('Count')\n"
+    "axes[1].axhline(LONG_N + SHORT_N, color='red', lw=1, ls='--',\n"
+    "                label=f'Min needed ({LONG_N+SHORT_N})')\n"
+    "axes[1].legend()\n"
+    "plt.tight_layout()\n"
+    "plt.savefig(FIGS / 'stock_coverage.png', bbox_inches='tight')\n"
+    "plt.show()\n\n"
+    "# Use only stocks with >60% coverage for the analysis\n"
+    "stocks_clean = stocks.loc[:, cov >= 0.60]\n"
+    "print(f'Stocks with >=60% coverage: {stocks_clean.shape[1]}')\n"
+    "print(f'Available stocks per week (mean): {stocks_clean.notna().sum(axis=1).mean():.1f}')\n"
+    "print(f'\\nFirst available date per stock:')\n"
+    "print(first_date[stocks_clean.columns].sort_values().head(10).dt.date)"
+))
+
+cells.append(md("---\n## Section 3 — Momentum Features"))
+
+cells.append(code(
+    "# ── Compute momentum features (all shifted 1 week, no lookahead) ──\n"
+    "mom1  = stocks_clean.shift(1)                          # 1w lag\n"
+    "mom4  = stocks_clean.shift(1).rolling(4, min_periods=3).mean()   # 4w mean\n"
+    "mom12 = stocks_clean.shift(1).rolling(12, min_periods=8).mean()  # 12w mean\n"
+    "mom26 = stocks_clean.shift(1).rolling(26, min_periods=20).mean() # 26w mean\n"
+    "rvol4 = stocks_clean.shift(1).rolling(4, min_periods=3).std()    # 4w vol\n\n"
+    "# Cross-sectional ranks (0=worst, 1=best) each week\n"
+    "def cs_rank(df):\n"
+    "    return df.rank(axis=1, pct=True, na_option='keep')\n\n"
+    "r_mom1  = cs_rank(mom1)\n"
+    "r_mom4  = cs_rank(mom4)\n"
+    "r_mom12 = cs_rank(mom12)\n"
+    "r_mom26 = cs_rank(mom26)\n"
+    "r_vol4  = cs_rank(-rvol4)    # lower vol = higher rank (quality filter)\n\n"
+    "# Forward return (next week's actual return)\n"
+    "fwd1 = stocks_clean.shift(-1)\n\n"
+    "print('Momentum features computed (all lagged 1w minimum).')\n"
+    "print(f'  mom1  non-null: {mom1.notna().sum().sum():,}')\n"
+    "print(f'  mom4  non-null: {mom4.notna().sum().sum():,}')\n"
+    "print(f'  mom12 non-null: {mom12.notna().sum().sum():,}')"
+))
+
+cells.append(md("---\n## Section 4 — IC Analysis: Which Momentum Horizon Predicts Best?"))
+
+cells.append(code(
+    "# ── Per-week IC for each feature, then aggregate ──\n"
+    "def rolling_cross_ic(feature_df, fwd_df, label):\n"
+    "    ics = []\n"
+    "    for date in feature_df.index:\n"
+    "        if date not in fwd_df.index: continue\n"
+    "        f = feature_df.loc[date].dropna()\n"
+    "        t = fwd_df.loc[date, f.index].dropna()\n"
+    "        common = f.index.intersection(t.index)\n"
+    "        if len(common) < 10: continue\n"
+    "        ic, _ = spearmanr(f[common], t[common])\n"
+    "        ics.append({'date': date, 'ic': ic})\n"
+    "    s = pd.DataFrame(ics).set_index('date')['ic']\n"
+    "    t_stat, p = ttest_1samp(s.dropna(), 0)\n"
+    "    print(f'  {label:<12} IC={s.mean():+.4f}  std={s.std():.4f}  IC+={( s>0).mean():.1%}  t={t_stat:+.2f}  p={p:.4f}')\n"
+    "    return s\n\n"
+    "print('Cross-sectional IC by momentum horizon:')\n"
+    "ic_mom1  = rolling_cross_ic(r_mom1,  fwd1, 'Mom 1w')\n"
+    "ic_mom4  = rolling_cross_ic(r_mom4,  fwd1, 'Mom 4w')\n"
+    "ic_mom12 = rolling_cross_ic(r_mom12, fwd1, 'Mom 12w')\n"
+    "ic_mom26 = rolling_cross_ic(r_mom26, fwd1, 'Mom 26w')\n"
+    "ic_vol4  = rolling_cross_ic(r_vol4,  fwd1, 'LowVol 4w')\n\n"
+    "# Plot rolling 52-week IC\n"
+    "fig, ax = plt.subplots(figsize=(13, 5))\n"
+    "for ic_ser, lbl, col in [\n"
+    "    (ic_mom1,  'Mom 1w',    '#EF5350'),\n"
+    "    (ic_mom4,  'Mom 4w',    '#1976D2'),\n"
+    "    (ic_mom12, 'Mom 12w',   '#388E3C'),\n"
+    "    (ic_mom26, 'Mom 26w',   '#7B1FA2'),\n"
+    "]:\n"
+    "    roll = ic_ser.rolling(52, min_periods=26).mean()\n"
+    "    ax.plot(roll, lw=1.5, color=col, label=f'{lbl} (mean={ic_ser.mean():+.4f})')\n"
+    "ax.axhline(0, color='black', lw=0.8, ls='--')\n"
+    "ax.set_ylabel('Rolling 52w IC')\n"
+    "ax.set_title('Cross-Sectional IC: Momentum Horizons vs Individual Stock Returns')\n"
+    "ax.legend(fontsize=9)\n"
+    "ax.set_ylim(-0.3, 0.3)\n"
+    "plt.tight_layout()\n"
+    "plt.savefig(FIGS / 'stock_momentum_ic.png', bbox_inches='tight')\n"
+    "plt.show()"
+))
+
+cells.append(md("---\n## Section 5 — Walk-Forward L/S Backtest"))
+
+cells.append(code(
+    "# ── Composite momentum score ──\n"
+    "# Weight: 1w reversal gets lower weight (often reversal, not momentum in weekly data)\n"
+    "# Focus on 4w and 12w momentum\n"
+    "def make_composite(weights):\n"
+    "    \"\"\"weights: dict of {rank_df: weight}\"\"\"\n"
+    "    comp = None\n"
+    "    total_w = sum(weights.values())\n"
+    "    for rank_df, w in weights.items():\n"
+    "        comp = rank_df * w if comp is None else comp + rank_df * w\n"
+    "    return comp / total_w\n\n"
+    "# Main composite: 4w + 12w momentum\n"
+    "comp_score = make_composite({r_mom4: 0.5, r_mom12: 0.5})\n\n"
+    "def wf_ls_stocks(score_df, fwd_df, long_n=5, short_n=5,\n"
+    "                  min_stocks=15, min_train_weeks=104, fold_size=52, tc=TC):\n"
+    "    \"\"\"\n"
+    "    Walk-forward cross-sectional L/S on individual stocks.\n"
+    "    Uses score at each date to rank stocks; long top-N, short bottom-N.\n"
+    "    No ML — pure momentum ranking.\n"
+    "    \"\"\"\n"
+    "    dates = score_df.index\n"
+    "    # Start after min_train_weeks (for IC stability check)\n"
+    "    start_idx = min_train_weeks\n"
+    "    records = []\n"
+    "    prev_longs  = set()\n"
+    "    prev_shorts = set()\n\n"
+    "    for i in range(start_idx, len(dates)):\n"
+    "        date = dates[i]\n"
+    "        if date not in fwd_df.index: continue\n\n"
+    "        scores = score_df.loc[date].dropna()\n"
+    "        fwds   = fwd_df.loc[date].dropna()\n"
+    "        valid  = scores.index.intersection(fwds.index)\n"
+    "        scores = scores[valid]; fwds = fwds[valid]\n\n"
+    "        if len(valid) < min_stocks: continue\n\n"
+    "        new_longs  = set(scores.nlargest(long_n).index)\n"
+    "        new_shorts = set(scores.nsmallest(short_n).index)\n\n"
+    "        # TC on position changes\n"
+    "        long_chg  = len((new_longs  ^ prev_longs))\n"
+    "        short_chg = len((new_shorts ^ prev_shorts))\n"
+    "        tc_cost   = (long_chg + short_chg) * tc\n\n"
+    "        long_ret  = fwds[list(new_longs)].mean()\n"
+    "        short_ret = fwds[list(new_shorts)].mean()\n"
+    "        port_ret  = (long_ret - short_ret) / 2\n"
+    "        bench_ret = fwds.mean()   # equal-weight universe\n\n"
+    "        # IC this week\n"
+    "        ic = float(spearmanr(scores, fwds)[0]) if len(valid) >= 10 else np.nan\n\n"
+    "        records.append({'date':date,'gross_ret':port_ret,\n"
+    "                        'net_ret':port_ret - tc_cost,'bench_ret':bench_ret,\n"
+    "                        'long_ret':long_ret,'short_ret':short_ret,\n"
+    "                        'ic':ic,'n_stocks':len(valid),'tc_cost':tc_cost})\n"
+    "        prev_longs  = new_longs\n"
+    "        prev_shorts = new_shorts\n\n"
+    "    return pd.DataFrame(records).set_index('date')\n\n"
+    "print('Running walk-forward L/S (composite momentum)...')\n"
+    "res_ls = wf_ls_stocks(comp_score, fwd1)\n"
+    "print(f'OOS weeks: {len(res_ls)}')\n"
+    "print(f'Avg stocks per week: {res_ls[\"n_stocks\"].mean():.1f}')\n"
+    "print(f'Avg TC/yr: {res_ls[\"tc_cost\"].mean()*52:.2%}')\n\n"
+    "def risk_metrics(rets, freq=52):\n"
+    "    r = pd.Series(rets).dropna()\n"
+    "    if len(r) < 10: return {}\n"
+    "    ann_ret = (1+r).prod()**(freq/len(r)) - 1\n"
+    "    ann_vol = r.std() * np.sqrt(freq)\n"
+    "    sharpe  = ann_ret / ann_vol if ann_vol > 0 else np.nan\n"
+    "    cum = (1+r).cumprod()\n"
+    "    max_dd = ((cum - cum.cummax()) / cum.cummax()).min()\n"
+    "    return {'ann_ret':ann_ret,'ann_vol':ann_vol,'sharpe':sharpe,\n"
+    "            'max_dd':max_dd,'win_rate':(r>0).mean(),'n':len(r)}\n\n"
+    "m = risk_metrics(res_ls['net_ret'])\n"
+    "ic_mean = res_ls['ic'].mean()\n"
+    "ic_pos  = (res_ls['ic'] > 0).mean()\n"
+    "t_ic, p_ic = ttest_1samp(res_ls['ic'].dropna(), 0)\n"
+    "print(f'\\nComposite Momentum L/S:')\n"
+    "print(f'  IC mean: {ic_mean:+.4f}  IC+: {ic_pos:.1%}  p={p_ic:.4f}')\n"
+    "print(f'  Gross Sharpe: {risk_metrics(res_ls[\"gross_ret\"])[\"sharpe\"]:+.3f}')\n"
+    "print(f'  Net Sharpe:   {m[\"sharpe\"]:+.3f}')\n"
+    "print(f'  Ann Return:   {m[\"ann_ret\"]:+.2%}')\n"
+    "print(f'  Max DD:       {m[\"max_dd\"]:+.1%}')"
+))
+
+cells.append(md("---\n## Section 6 — Momentum Variants Comparison"))
+
+cells.append(code(
+    "# Compare different momentum specs\n"
+    "specs = {\n"
+    "    'Mom4w only':           make_composite({r_mom4: 1.0}),\n"
+    "    'Mom12w only':          make_composite({r_mom12: 1.0}),\n"
+    "    'Mom4+12w (50/50)':     make_composite({r_mom4: 0.5, r_mom12: 0.5}),\n"
+    "    'Mom4+12+26':           make_composite({r_mom4: 0.4, r_mom12: 0.4, r_mom26: 0.2}),\n"
+    "    'Mom+LowVol':           make_composite({r_mom4: 0.4, r_mom12: 0.4, r_vol4: 0.2}),\n"
+    "    'Mom1w (reversal)':     make_composite({r_mom1: 1.0}),\n"
+    "}\n\n"
+    "print(f'{\"Spec\":<28} {\"Gross Sharpe\":>13} {\"Net Sharpe\":>11} {\"AnnRet\":>8} {\"IC mean\":>8} {\"p\":>8}')\n"
+    "print('-' * 82)\n"
+    "best_spec_name = None\n"
+    "best_spec_sharpe = -999\n\n"
+    "for spec_name, score_df in specs.items():\n"
+    "    res = wf_ls_stocks(score_df, fwd1)\n"
+    "    mg = risk_metrics(res['gross_ret'])\n"
+    "    mn = risk_metrics(res['net_ret'])\n"
+    "    ic_m = res['ic'].mean()\n"
+    "    _, p = ttest_1samp(res['ic'].dropna(), 0)\n"
+    "    sig = ' *' if p < 0.05 else ''\n"
+    "    print(f'{spec_name:<28} {mg[\"sharpe\"]:>13.3f} {mn[\"sharpe\"]:>11.3f} '\n"
+    "          f'{mn[\"ann_ret\"]:>8.2%} {ic_m:>+8.4f} {p:>8.4f}{sig}')\n"
+    "    if mn.get('sharpe', -999) > best_spec_sharpe:\n"
+    "        best_spec_sharpe = mn['sharpe']\n"
+    "        best_spec_name   = spec_name\n"
+    "        best_score_df    = score_df\n"
+    "        best_res         = res\n\n"
+    "print(f'\\nBest spec: {best_spec_name} (Net Sharpe={best_spec_sharpe:+.3f})')"
+))
+
+cells.append(md("---\n## Section 7 — EEM-Gated: Only Run Momentum When EEM+"))
+
+cells.append(code(
+    "# EEM gate: only run L/S when EEM signal is positive\n"
+    "eem_pos = (macro['eem_ret_d_lag1'] > 0).reindex(best_score_df.index).fillna(False)\n\n"
+    "print('Running EEM-gated momentum...')\n"
+    "res_gated = wf_ls_stocks(best_score_df, fwd1)\n"
+    "# Apply EEM gate: zero out returns on EEM- weeks\n"
+    "res_gated_net = res_gated['net_ret'].copy()\n"
+    "res_gated_gross = res_gated['gross_ret'].copy()\n"
+    "eem_mask = eem_pos.reindex(res_gated_net.index).fillna(False)\n"
+    "res_gated_net[~eem_mask]   = 0.0\n"
+    "res_gated_gross[~eem_mask] = 0.0\n\n"
+    "m_gated   = risk_metrics(res_gated_net)\n"
+    "m_best_ls = risk_metrics(best_res['net_ret'])\n"
+    "print(f'{\"Strategy\":<30} {\"Net Sharpe\":>11} {\"AnnRet\":>9} {\"MaxDD\":>8}')\n"
+    "print('-' * 62)\n"
+    "print(f'{\"Best momentum L/S\":<30} {m_best_ls[\"sharpe\"]:>11.3f} {m_best_ls[\"ann_ret\"]:>9.2%} {m_best_ls[\"max_dd\"]:>8.1%}')\n"
+    "print(f'{\"EEM-gated momentum\":<30} {m_gated[\"sharpe\"]:>11.3f} {m_gated[\"ann_ret\"]:>9.2%} {m_gated[\"max_dd\"]:>8.1%}')\n"
+    "if m_gated['sharpe'] > m_best_ls['sharpe']:\n"
+    "    print('  => EEM gate IMPROVES momentum strategy')\n"
+    "else:\n"
+    "    print('  => EEM gate does not help momentum strategy')"
+))
+
+cells.append(md("---\n## Section 8 — Equity Curves & Verdict"))
+
+cells.append(code(
+    "# ── Equity curves ──\n"
+    "bnh_stocks = res_ls['bench_ret']   # equal-weight universe\n"
+    "set_index  = macro['SET_index_ret_w'].reindex(res_ls.index)\n\n"
+    "fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios':[3,1]})\n"
+    "fig.suptitle('Stock-Level Cross-Sectional Momentum: Walk-Forward', fontsize=12)\n\n"
+    "ax = axes[0]\n"
+    "for rets, lbl, col, lw, ls in [\n"
+    "    (best_res['net_ret'],  f'Best Momentum L/S (net TC)', '#1976D2', 2.0, '-'),\n"
+    "    (res_gated_net,        'EEM-gated Momentum',          '#FF6F00', 2.0, '-'),\n"
+    "    (best_res['gross_ret'],'Best Momentum L/S (gross)',   '#90CAF9', 1.0, '--'),\n"
+    "    (bnh_stocks,           'Equal-Weight Universe',       '#4CAF50', 1.5, ':'),\n"
+    "    (set_index,            'SET Index',                   '#9E9E9E', 1.0, ':'),\n"
+    "]:\n"
+    "    m   = risk_metrics(rets)\n"
+    "    cum = (1 + rets.dropna()).cumprod()\n"
+    "    ax.plot(cum, lw=lw, ls=ls, color=col,\n"
+    "            label=f'{lbl}  Sharpe={m.get(\"sharpe\",0):+.2f}')\n"
+    "ax.axhline(1.0, color='gray', lw=0.5, ls=':')\n"
+    "ax.set_yscale('log')\n"
+    "ax.set_ylabel('Cumulative Return (log)')\n"
+    "ax.legend(fontsize=8, loc='upper left')\n"
+    "ax.set_title('Stock-Level Momentum: OOS Performance')\n\n"
+    "# IC over time\n"
+    "roll_ic = best_res['ic'].rolling(52, min_periods=26).mean()\n"
+    "axes[1].plot(roll_ic, color='#1976D2', lw=1.5)\n"
+    "axes[1].axhline(0, color='black', lw=0.8, ls='--')\n"
+    "axes[1].fill_between(roll_ic.index, 0, roll_ic,\n"
+    "                     where=roll_ic >= 0, alpha=0.3, color='#1976D2')\n"
+    "axes[1].fill_between(roll_ic.index, 0, roll_ic,\n"
+    "                     where=roll_ic < 0,  alpha=0.3, color='#EF5350')\n"
+    "axes[1].set_ylabel('Rolling IC (52w)')\n"
+    "axes[1].set_title(f'Cross-Sectional IC (mean={best_res[\"ic\"].mean():+.4f})')\n\n"
+    "plt.tight_layout()\n"
+    "plt.savefig(FIGS / 'stock_momentum_equity.png', bbox_inches='tight')\n"
+    "plt.show()\n"
+    "print('Saved: figs/stock_momentum_equity.png')"
+))
+
+cells.append(code(
+    "# ── Final scorecard ──\n"
+    "ic_ser = best_res['ic'].dropna()\n"
+    "t_ic, p_ic = ttest_1samp(ic_ser, 0)\n"
+    "icir = ic_ser.mean() / ic_ser.std() * np.sqrt(len(ic_ser))\n"
+    "m_net = risk_metrics(best_res['net_ret'])\n"
+    "_, p_ret = ttest_1samp(best_res['net_ret'].dropna(), 0)\n"
+    "annual = best_res['net_ret'].groupby(best_res['net_ret'].index.year).apply(lambda r:(1+r).prod()-1)\n\n"
+    "evidence = [\n"
+    "    ('IC mean > 0.03',              ic_ser.mean(),         ic_ser.mean() > 0.03),\n"
+    "    ('IC t-test p < 0.05',          p_ic,                  p_ic < 0.05),\n"
+    "    ('ICIR > 0.5',                  icir,                  icir > 0.5),\n"
+    "    ('IC+ fraction > 55%',          (ic_ser>0).mean(),     (ic_ser>0).mean() > 0.55),\n"
+    "    ('Net Sharpe > 0.3',            m_net['sharpe'],       m_net['sharpe'] > 0.3),\n"
+    "    ('Net Sharpe > 0',              m_net['sharpe'],       m_net['sharpe'] > 0),\n"
+    "    ('Annual return > 5%',          m_net['ann_ret'],      m_net['ann_ret'] > 0.05),\n"
+    "    ('Max DD > -40%',               m_net['max_dd'],       m_net['max_dd'] > -0.40),\n"
+    "    ('Positive years > 55%',        (annual>0).mean(),     (annual>0).mean() > 0.55),\n"
+    "    ('Return t-test p < 0.05',      p_ret,                 p_ret < 0.05),\n"
+    "]\n"
+    "score = sum(1 for *_,p in evidence if p)\n\n"
+    "print('='*65)\n"
+    "print(f'STOCK-LEVEL MOMENTUM VERDICT  [{best_spec_name}]')\n"
+    "print('='*65)\n"
+    "print(f'{\"Evidence\":<40} {\"Value\":>10}')\n"
+    "print('-'*55)\n"
+    "for desc, val, passed in evidence:\n"
+    "    mark = '[+]' if passed else '[-]'\n"
+    "    fmt = f'{val:>+10.4f}' if abs(val) < 2 else f'{val:>+10.1%}'\n"
+    "    print(f'{mark} {desc:<40} {fmt}')\n"
+    "print(f'\\nScore: {score}/{len(evidence)}')\n"
+    "if score >= 7:   v = 'STRONG — stock-level alpha exists'\n"
+    "elif score >= 5: v = 'MODERATE — viable momentum signal'\n"
+    "elif score >= 3: v = 'WEAK — marginal signal, needs more features'\n"
+    "else:            v = 'NO SIGNAL found with momentum alone'\n"
+    "print(f'=> {v}')\n\n"
+    "print(f'\\nComparison with market/sector strategies:')\n"
+    "print(f'  EEM L/flat (NB16):         Sharpe +0.58')\n"
+    "print(f'  EEM+sector tilt (NB17):    Sharpe +0.62')\n"
+    "print(f'  Stock momentum L/S (NB19): Sharpe {m_net[\"sharpe\"]:+.2f}')\n"
+    "if m_net['sharpe'] > 0.62:\n"
+    "    print('  => Stock-level adds INCREMENTAL ALPHA over market-level strategies')\n"
+    "elif m_net['sharpe'] > 0:\n"
+    "    print('  => Stock-level is positive but does not beat EEM signal alone')\n"
+    "else:\n"
+    "    print('  => Momentum alone insufficient — add financial factors or EEM gate')"
+))
+
+nb = {
+    "nbformat": 4, "nbformat_minor": 5,
+    "metadata": {
+        "kernelspec": {"display_name":"Python 3","language":"python","name":"python3"},
+        "language_info": {"name":"python","version":"3.10.0"},
+    },
+    "cells": cells,
+}
+OUT.parent.mkdir(parents=True, exist_ok=True)
+with open(OUT, "w") as f:
+    json.dump(nb, f, indent=1)
+print(f"Written: {OUT}  ({len(cells)} cells)")
