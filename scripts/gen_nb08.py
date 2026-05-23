@@ -1,5 +1,5 @@
 """
-gen_nb08.py -- generate notebooks/model/06_alpha_validation.ipynb
+gen_nb08.py -- generate notebooks/eda/09_alpha_validation.ipynb
 
 9-section alpha signal validation notebook.
 Goal: determine whether a real, statistically robust predictive signal exists.
@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-OUT  = ROOT / 'notebooks' / 'model' / '06_alpha_validation.ipynb'
+OUT  = ROOT / 'notebooks' / 'eda' / '09_alpha_validation.ipynb'
 
 def md(source): return {"cell_type": "markdown", "metadata": {}, "source": source}
 def code(source):

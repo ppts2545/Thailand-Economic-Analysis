@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-OUT  = ROOT / 'notebooks' / 'eda' / '08_alpha_validation.ipynb'
+OUT  = ROOT / 'notebooks' / 'eda' / '08_signal_robustness.ipynb'
 
 def md(source): return {"cell_type": "markdown", "metadata": {}, "source": source}
 def code(source):
