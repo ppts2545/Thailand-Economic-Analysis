@@ -10,11 +10,15 @@ Steps:
   4. fetch_set_stocks.py      → set_stocks_weekly.csv
   5. src/preprocess_weekly.py → unified_weekly.csv
   6. NB07 (nbconvert)         → unified_weekly_clean.csv
+  7. fetch_bot_bonds.py       → bot_bond_yields.csv  (Thai yield curve)
+  8. fetch_set_flow.py        → set_fund_flow.csv    (foreign/inst/retail net flow)
+  9. fetch_tfex_pcr.py        → tfex_pcr.csv         (SET50 put/call ratio)
 
 Usage:
   python3 pipeline.py            # run all steps
   python3 pipeline.py --fetch    # step 1-4 only (data fetching)
   python3 pipeline.py --process  # step 5-6 only (preprocessing)
+  python3 pipeline.py --alt      # step 7-9 only (alternative signals)
   python3 pipeline.py --step 3   # run single step
 """
 
@@ -71,6 +75,24 @@ STEPS = [
         ],
         'out':  'data/processed/unified_weekly_clean.csv',
     },
+    {
+        'id':   7,
+        'name': 'Fetch Thai bond yields (BOT)',
+        'cmd':  [PYTHON, 'scripts/fetch_bot_bonds.py'],
+        'out':  'data/raw/bot_bond_yields.csv',
+    },
+    {
+        'id':   8,
+        'name': 'Fetch SET fund flow by investor type',
+        'cmd':  [PYTHON, 'scripts/fetch_set_flow.py'],
+        'out':  'data/raw/set_fund_flow.csv',
+    },
+    {
+        'id':   9,
+        'name': 'Fetch TFEX SET50 put/call ratio',
+        'cmd':  [PYTHON, 'scripts/fetch_tfex_pcr.py'],
+        'out':  'data/raw/tfex_pcr.csv',
+    },
 ]
 
 # ── Runner ────────────────────────────────────────────────────────────────────
@@ -110,7 +132,8 @@ def main():
     parser = argparse.ArgumentParser(description='Thailand alpha project pipeline')
     parser.add_argument('--fetch',   action='store_true', help='Run steps 1-4 (fetch only)')
     parser.add_argument('--process', action='store_true', help='Run steps 5-6 (preprocess only)')
-    parser.add_argument('--step',    type=int,            help='Run single step by number (1-6)')
+    parser.add_argument('--alt',     action='store_true', help='Run steps 7-9 (alt signals: bonds/flow/pcr)')
+    parser.add_argument('--step',    type=int,            help='Run single step by number (1-9)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would run, no execution')
     args = parser.parse_args()
 
@@ -118,12 +141,14 @@ def main():
     if args.step:
         steps = [s for s in STEPS if s['id'] == args.step]
         if not steps:
-            print(f'Error: step {args.step} not found (valid: 1-6)')
+            print(f'Error: step {args.step} not found (valid: 1-9)')
             sys.exit(1)
     elif args.fetch:
         steps = [s for s in STEPS if s['id'] <= 4]
     elif args.process:
-        steps = [s for s in STEPS if s['id'] >= 5]
+        steps = [s for s in STEPS if s['id'] >= 5 and s['id'] <= 6]
+    elif args.alt:
+        steps = [s for s in STEPS if s['id'] >= 7]
     else:
         steps = STEPS
 
