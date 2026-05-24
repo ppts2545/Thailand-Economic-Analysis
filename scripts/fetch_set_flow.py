@@ -29,7 +29,7 @@ import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 ROOT    = Path(__file__).parent.parent
 RAW_DIR = ROOT / 'data' / 'raw'
