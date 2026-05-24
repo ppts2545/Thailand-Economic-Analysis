@@ -3,9 +3,12 @@ gen_nb22_new_signals.py
 Generate notebooks/eda/22_new_signals.ipynb
 
 Tests three new alternative data signals:
-  1. Thai yield curve slope   (bot_bond_yields.csv)
-  2. SET foreign fund flow    (set_fund_flow.csv)
-  3. TFEX put/call ratio      (tfex_pcr.csv)
+  1. Thai yield curve slope   (bot_bond_yields.csv  — BOT API)
+  2. THD ETF relative return  (yfinance — proxy for foreign demand on Thailand)
+  3. VIX term structure       (yfinance ^VIX3M/^VIX — proxy for options sentiment)
+
+Note: SET investor-type API and TFEX PCR API are both blocked by Incapsula WAF.
+      We substitute with freely available yfinance proxies.
 
 Each signal: IC vs 1w forward SET return, regime table, backtest vs NB21 baseline.
 """
@@ -29,17 +32,21 @@ cells = []
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 cells.append(md("""
-    # NB22 — New Signals: Thai Bond Yields, Fund Flow, Put/Call Ratio
+    # NB22 — New Signals: Thai Bond Yields, THD Foreign Demand, VIX Term Structure
 
-    Tests three alternative data signals for alpha:
+    Tests three alternative data signals for alpha enhancement:
 
     | Signal | Source | Hypothesis |
     |--------|--------|-----------|
-    | **TH yield slope** (10Y–1Y) | Bank of Thailand | Steepening = risk-on → bullish SET |
-    | **Foreign net flow** (13w cumul) | SET investor type | Sustained foreign buying → momentum |
-    | **PCR Z-score** (52w rolling) | TFEX SET50 | Extreme put buying = contrarian buy |
+    | **TH yield slope** (10Y–1Y) | Bank of Thailand API | Steepening = risk-on → bullish SET |
+    | **THD vs EEM relative return** | yfinance (NYSE-listed ETF) | Foreign excess demand for Thailand → momentum |
+    | **VIX term structure** (VIX3M − VIX) | yfinance (CBOE) | Backwardation (fear spike) = contrarian buy |
 
     Methodology: IC vs 1-week forward SET return, regime analysis, system integration.
+
+    > **Note:** SET investor-type API and TFEX PCR API are blocked by Incapsula WAF.
+    > We use yfinance proxies: THD ETF tracks MSCI Thailand (US-listed, reflects foreign demand),
+    > VIX3M/VIX term structure is a proxy for options market fear/complacency.
 """))
 
 # ── 1. Setup ──────────────────────────────────────────────────────────────────
@@ -67,7 +74,7 @@ plt.rcParams.update({
 WEEKS_PER_YEAR = 52
 RF_ANNUAL      = 0.02
 TC_ONE_WAY     = 0.001
-START          = '2010-01-01'   # all three new sources start ~2010
+START          = '2010-01-01'
 """))
 
 cells.append(code("""\
@@ -77,410 +84,400 @@ df_base = pd.read_csv(DATA / 'unified_weekly_clean.csv',
 df_base = df_base.loc[START:]
 
 set_ret  = df_base['SET_index_ret_w']
-eem_sig  = df_base['eem_ret_d_lag1']
-
-# Existing US yield slope for comparison (already in the feature set)
-us_slope_existing = df_base['yield_curve_slope'] if 'yield_curve_slope' in df_base.columns else None
+gold_ret = df_base['gold_ret_w']
+eem_ret  = df_base['eem_ret_d_lag1'] if 'eem_ret_d_lag1' in df_base.columns else None
 
 print(f'Base data: {df_base.shape[0]} weeks  '
       f'{df_base.index[0].date()} -> {df_base.index[-1].date()}')
 print(f'SET return — mean: {set_ret.mean()*52:.1%}  std: {set_ret.std()*52**0.5:.1%}')
 """))
 
-# ── 2. Thai Bond Yield Slope ───────────────────────────────────────────────────
-cells.append(md("""
-    ## 2. Signal 1 — Thai Yield Curve Slope (10Y – 1Y)
-
-    A steep yield curve signals healthy growth expectations → bullish equities.
-    An inverted curve precedes recessions → bearish.
-    This is the **Thai domestic** version vs the US slope we already have.
-"""))
-
-cells.append(code("""\
-bonds_path = RAW / 'bot_bond_yields.csv'
-has_bonds = bonds_path.exists()
-print(f'bot_bond_yields.csv exists: {has_bonds}')
-if has_bonds:
-    bonds = pd.read_csv(bonds_path, parse_dates=['date'])
-    bonds = bonds.set_index('date').sort_index()
-    print(bonds.tail(3))
-    print(f'Columns: {bonds.columns.tolist()}')
-    print(f'Rows: {len(bonds)}  '
-          f'{bonds.index[0].date()} -> {bonds.index[-1].date()}')
-"""))
-
-cells.append(code("""\
-if has_bonds:
-    # Compute slope: 10Y - 1Y  (in percentage points)
-    bonds['th_slope'] = bonds['yield_10y'] - bonds['yield_1y']
-    bonds['th_slope_chg_4w'] = bonds['th_slope'].diff(4)   # 4-week change in slope
-
-    # Resample to weekly (last observation in week, forward-fill)
-    bonds_w = bonds[['th_slope', 'th_slope_chg_4w']].resample('W-FRI').last().ffill()
-
-    print('Thai yield slope (weekly):')
-    print(bonds_w.tail(5).to_string())
-    print(f'Mean slope: {bonds_w["th_slope"].mean():.2f}pp  '
-          f'Std: {bonds_w["th_slope"].std():.2f}pp')
-"""))
-
+# ── Helper: IC function ────────────────────────────────────────────────────────
 cells.append(code("""\
 def compute_ic(signal: pd.Series, forward_ret: pd.Series,
                lag: int = 1, label: str = '') -> dict:
-    '''
-    Information Coefficient (Spearman rank correlation).
-    signal is lagged by `lag` weeks before correlating with forward_ret.
-    '''
+    '''Spearman rank IC — signal lagged by `lag` weeks before correlating.'''
     sig_lagged = signal.shift(lag)
     both = pd.concat([sig_lagged, forward_ret], axis=1).dropna()
     both.columns = ['sig', 'ret']
     r, p = stats.spearmanr(both['sig'], both['ret'])
     n = len(both)
-    t = r * np.sqrt(n - 2) / np.sqrt(1 - r**2 + 1e-12)
     stars = '***' if p < 0.01 else ('**' if p < 0.05 else ('*' if p < 0.1 else ''))
-    print(f'  IC {label:35s}: {r:+.4f}  p={p:.3f} {stars}  n={n}')
+    print(f'  IC {label:40s}: {r:+.4f}  p={p:.3f} {stars}  n={n}')
     return {'label': label, 'IC': r, 'p': p, 'n': n, 'stars': stars}
 
 ic_results = []
 """))
 
-cells.append(code("""\
-if has_bonds:
-    # Align to SET return index
-    sig_slope = bonds_w['th_slope'].reindex(set_ret.index).ffill()
-    sig_slope_chg = bonds_w['th_slope_chg_4w'].reindex(set_ret.index).ffill()
+# ── 2. Thai Bond Yield Slope ───────────────────────────────────────────────────
+cells.append(md("""
+    ## 2. Signal 1 — Thai Yield Curve Slope (10Y – 1Y)
 
-    print('IC analysis — Thai bond yield signals:')
-    ic_results.append(compute_ic(sig_slope,     set_ret, lag=1, label='TH yield slope level (lag1)'))
-    ic_results.append(compute_ic(sig_slope_chg, set_ret, lag=1, label='TH yield slope 4w change (lag1)'))
-    ic_results.append(compute_ic(sig_slope,     set_ret, lag=2, label='TH yield slope level (lag2)'))
-else:
-    print('No bond data yet — run: python3 scripts/fetch_bot_bonds.py')
-    print('Skipping to next signal...')
+    A steep Thai yield curve signals healthy domestic growth expectations.
+    Source: Bank of Thailand Open API (monthly data, forward-filled to weekly).
+
+    **Feature:** `th_slope = yield_10y − yield_1y` and its 4-month change.
+"""))
+
+cells.append(code("""\
+bonds_path = RAW / 'bot_bond_yields.csv'
+has_bonds = bonds_path.exists()
+print(f'bot_bond_yields.csv  exists: {has_bonds}')
+if has_bonds:
+    bonds = pd.read_csv(bonds_path, parse_dates=['date'])
+    bonds = bonds.set_index('date').sort_index()
+    print(bonds[['yield_1y', 'yield_10y', 'th_slope']].tail(5).to_string())
+    print(f'Rows: {len(bonds)}  {bonds.index[0].date()} -> {bonds.index[-1].date()}')
 """))
 
 cells.append(code("""\
 if has_bonds:
-    # Regime analysis: slope terciles
-    sig_slope_lag = sig_slope.shift(1)
-    q33 = sig_slope_lag.quantile(0.33)
-    q67 = sig_slope_lag.quantile(0.67)
+    # slope = 10Y - 1Y; 4-month change in slope (each obs is 1 month)
+    bonds['th_slope']      = bonds['yield_10y'] - bonds['yield_1y']
+    bonds['th_slope_chg4'] = bonds['th_slope'].diff(4)
 
-    regime_slope = pd.cut(
-        sig_slope_lag,
-        bins=[-np.inf, q33, q67, np.inf],
-        labels=['Inverted/Flat', 'Normal', 'Steep']
-    )
+    # Weekly (last obs in each week, forward-fill across weeks)
+    bonds_w = bonds[['th_slope', 'th_slope_chg4']].resample('W-FRI').last().ffill()
 
-    ret_by_regime = {}
-    for label in ['Inverted/Flat', 'Normal', 'Steep']:
-        mask = regime_slope == label
-        ann  = set_ret[mask].mean() * WEEKS_PER_YEAR
-        ret_by_regime[label] = ann
-        print(f'  {label:15s}: AnnRet = {ann:+.1%}  n={mask.sum()}')
+    # Align to SET index
+    sig_slope      = bonds_w['th_slope'].reindex(set_ret.index).ffill()
+    sig_slope_chg  = bonds_w['th_slope_chg4'].reindex(set_ret.index).ffill()
+
+    print(f'Mean slope: {bonds_w["th_slope"].mean():.2f}pp  '
+          f'Std: {bonds_w["th_slope"].std():.2f}pp')
+    print()
+    print('IC analysis — Thai bond yield slope:')
+    ic_results.append(compute_ic(sig_slope,     set_ret, lag=1, label='TH slope level (lag1)'))
+    ic_results.append(compute_ic(sig_slope_chg, set_ret, lag=1, label='TH slope 4m change (lag1)'))
+    ic_results.append(compute_ic(sig_slope,     set_ret, lag=2, label='TH slope level (lag2)'))
+else:
+    print('No bond data — run: python3 scripts/fetch_bot_bonds.py')
+    sig_slope = sig_slope_chg = None
+"""))
+
+cells.append(code("""\
+if has_bonds and sig_slope is not None:
+    # Regime: slope terciles
+    sig_lag = sig_slope.shift(1)
+    q33, q67 = sig_lag.quantile([0.33, 0.67])
+    regime = pd.cut(sig_lag, bins=[-np.inf, q33, q67, np.inf],
+                    labels=['Inverted/Flat', 'Normal', 'Steep'])
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    # Time series of slope
     bonds_w['th_slope'].plot(ax=axes[0], color='steelblue')
     axes[0].axhline(0, color='red', lw=0.8, ls='--')
-    axes[0].set_title('Thai Yield Curve Slope (10Y - 1Y)')
+    axes[0].set_title('Thai Yield Curve Slope (10Y − 1Y)')
     axes[0].set_ylabel('Percentage points')
 
-    # Regime returns
+    ret_by_regime = {lbl: set_ret[regime == lbl].mean() * WEEKS_PER_YEAR
+                     for lbl in ['Inverted/Flat', 'Normal', 'Steep']}
+    for lbl, v in ret_by_regime.items():
+        print(f'  {lbl:15s}: AnnRet = {v:+.1%}  n={int((regime==lbl).sum())}')
+
     labels = list(ret_by_regime.keys())
     values = [ret_by_regime[l] for l in labels]
     colors = ['#e74c3c' if v < 0 else '#2ecc71' for v in values]
     axes[1].bar(labels, values, color=colors, alpha=0.8, edgecolor='white')
-    axes[1].set_title('SET Ann. Return by Yield Curve Regime (1w forward, lag1)')
-    axes[1].set_ylabel('Annualised return')
-    axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
     axes[1].axhline(0, color='black', lw=0.6)
+    axes[1].set_title('SET Ann. Return by Yield Curve Regime (lag1)')
+    axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
 
     plt.tight_layout()
     plt.savefig(FIGS / 'nb22_bond_signal.png', bbox_inches='tight')
     plt.show()
 """))
 
-# ── 3. SET Foreign Fund Flow ───────────────────────────────────────────────────
+# ── 3. THD ETF — Foreign Demand Proxy ─────────────────────────────────────────
 cells.append(md("""
-    ## 3. Signal 2 — SET Foreign Fund Flow
+    ## 3. Signal 2 — THD ETF: Foreign Demand Proxy
 
-    **Hypothesis:** Sustained foreign buying (high 13-week cumulative net) drives momentum.
-    Foreign flow is often informed (macro, global allocation) so it tends to persist.
+    **THD** (iShares MSCI Thailand ETF, NYSE) tracks the MSCI Thailand Index.
+    When global investors want exposure to Thai equities, they buy THD.
+    THD relative to EEM (broad EM) isolates **Thailand-specific** foreign demand.
 
-    **Feature:** 13-week rolling sum of foreign net buy, Z-scored (52-week rolling).
+    > SET investor-type API (foreign/institutional net flow) is behind Incapsula WAF
+    > and cannot be accessed programmatically. THD is a reliable real-time proxy.
+
+    **Features:**
+    - `thd_rel_1w` = THD weekly return − EEM weekly return (weekly alpha signal)
+    - `thd_rel_4w` = 4-week rolling sum of thd_rel_1w (trend signal)
+    - `thd_rel_z`  = thd_rel_4w z-scored over 52-week rolling window
+
+    **Hypothesis:** When foreigners over-allocate to Thailand (positive thd_rel),
+    fund flow momentum drives SET higher.
 """))
 
 cells.append(code("""\
-flow_path = RAW / 'set_fund_flow.csv'
-has_flow = flow_path.exists()
-print(f'set_fund_flow.csv exists: {has_flow}')
-if has_flow:
-    flow = pd.read_csv(flow_path, parse_dates=['date'])
-    flow = flow.set_index('date').sort_index()
-    print(flow.tail(3).to_string())
-    print(f'Rows: {len(flow)}  '
-          f'{flow.index[0].date()} -> {flow.index[-1].date()}')
+import yfinance as yf
+
+print('Fetching THD and EEM from Yahoo Finance...')
+thd_raw = yf.download('THD', start='2009-01-01', progress=False)
+eem_raw = yf.download('EEM', start='2009-01-01', progress=False)
+
+# Handle MultiIndex columns from yfinance ≥0.2
+def get_close(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        return df['Close'].iloc[:, 0]
+    return df['Close']
+
+thd_close = get_close(thd_raw)
+eem_close = get_close(eem_raw)
+
+print(f'THD: {len(thd_close)} days  {thd_close.index[0].date()} -> {thd_close.index[-1].date()}')
+print(f'EEM: {len(eem_close)} days  {eem_close.index[0].date()} -> {eem_close.index[-1].date()}')
 """))
 
 cells.append(code("""\
-if has_flow:
-    # Convert daily → weekly sum
-    flow_w = flow[['foreign_net', 'institutional_net', 'retail_net']].resample('W-FRI').sum()
+# Weekly returns (end-of-week Friday)
+thd_w = thd_close.resample('W-FRI').last().pct_change()
+eem_w = eem_close.resample('W-FRI').last().pct_change()
 
-    # 13-week cumulative foreign flow (momentum signal)
-    flow_w['foreign_cum13'] = flow_w['foreign_net'].rolling(13).sum()
+# THD relative return (Thailand-specific foreign demand)
+thd_rel_1w = thd_w - eem_w                          # 1-week alpha
+thd_rel_4w = thd_rel_1w.rolling(4).sum()             # 4-week cumulative
+roll52     = thd_rel_4w.rolling(52)
+thd_rel_z  = (thd_rel_4w - roll52.mean()) / (roll52.std() + 1e-9)  # z-score
 
-    # Z-score vs trailing 52 weeks (standardise across regimes)
-    roll52 = flow_w['foreign_cum13'].rolling(52)
-    flow_w['foreign_z'] = (flow_w['foreign_cum13'] - roll52.mean()) / (roll52.std() + 1e-9)
+# Align to SET return index
+sig_thd_1w = thd_rel_1w.reindex(set_ret.index).ffill()
+sig_thd_4w = thd_rel_4w.reindex(set_ret.index).ffill()
+sig_thd_z  = thd_rel_z.reindex(set_ret.index).ffill()
 
-    # Also: single-week flow normalised
-    roll52_1w = flow_w['foreign_net'].rolling(52)
-    flow_w['foreign_1w_z'] = (
-        (flow_w['foreign_net'] - roll52_1w.mean()) / (roll52_1w.std() + 1e-9)
-    )
-
-    print('Foreign fund flow (weekly):')
-    print(flow_w[['foreign_net', 'foreign_cum13', 'foreign_z']].tail(5).to_string())
+print('THD vs EEM weekly relative return (last 5):')
+df_preview = pd.DataFrame({'thd_w': thd_w, 'eem_w': eem_w, 'thd_rel': thd_rel_1w})
+print(df_preview.tail(5).to_string())
+print()
+print('IC analysis — THD foreign demand proxy:')
+ic_results.append(compute_ic(sig_thd_1w, set_ret, lag=1, label='THD−EEM 1w rel return (lag1)'))
+ic_results.append(compute_ic(sig_thd_4w, set_ret, lag=1, label='THD−EEM 4w cumul  (lag1)'))
+ic_results.append(compute_ic(sig_thd_z,  set_ret, lag=1, label='THD−EEM 4w Z-score (lag1)'))
+ic_results.append(compute_ic(sig_thd_z,  set_ret, lag=2, label='THD−EEM 4w Z-score (lag2)'))
 """))
 
 cells.append(code("""\
-if has_flow:
-    sig_flow_z  = flow_w['foreign_z'].reindex(set_ret.index).ffill()
-    sig_flow_1w = flow_w['foreign_1w_z'].reindex(set_ret.index).ffill()
+# Regime: THD z-score quartiles
+sig_thd_lag = sig_thd_z.shift(1)
+q25, q75 = sig_thd_lag.quantile([0.25, 0.75])
+regime_thd = pd.cut(sig_thd_lag,
+                    bins=[-np.inf, q25, q75, np.inf],
+                    labels=['Foreign Outflow', 'Neutral', 'Foreign Inflow'])
 
-    print('IC analysis — SET foreign fund flow signals:')
-    ic_results.append(compute_ic(sig_flow_z,  set_ret, lag=1, label='Foreign flow 13w Z-score (lag1)'))
-    ic_results.append(compute_ic(sig_flow_1w, set_ret, lag=1, label='Foreign flow 1w Z-score (lag1)'))
-    ic_results.append(compute_ic(sig_flow_z,  set_ret, lag=2, label='Foreign flow 13w Z-score (lag2)'))
-else:
-    print('No fund flow data yet — run: python3 scripts/fetch_set_flow.py')
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+sig_thd_z.plot(ax=axes[0], color='#3498db', alpha=0.8)
+axes[0].axhline(0, color='black', lw=0.5)
+axes[0].axhline( 1.5, color='green',  lw=0.8, ls='--', alpha=0.6, label='+1.5σ')
+axes[0].axhline(-1.5, color='red',    lw=0.8, ls='--', alpha=0.6, label='−1.5σ')
+axes[0].set_title('THD vs EEM 4w Relative Return Z-score')
+axes[0].legend(fontsize=8)
+
+ret_by_thd = {lbl: set_ret[regime_thd == lbl].mean() * WEEKS_PER_YEAR
+              for lbl in ['Foreign Outflow', 'Neutral', 'Foreign Inflow']}
+for lbl, v in ret_by_thd.items():
+    print(f'  {lbl:20s}: AnnRet = {v:+.1%}  n={int((regime_thd==lbl).sum())}')
+
+labels = list(ret_by_thd.keys())
+values = [ret_by_thd[l] for l in labels]
+colors = ['#e74c3c' if v < 0 else '#2ecc71' for v in values]
+axes[1].bar(labels, values, color=colors, alpha=0.8, edgecolor='white')
+axes[1].axhline(0, color='black', lw=0.6)
+axes[1].set_title('SET Ann. Return by THD Foreign Demand Regime (lag1)')
+axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
+
+plt.tight_layout()
+plt.savefig(FIGS / 'nb22_thd_signal.png', bbox_inches='tight')
+plt.show()
 """))
 
-cells.append(code("""\
-if has_flow:
-    # Regime: foreign flow z-score quartiles
-    sig_flow_lag = sig_flow_z.shift(1)
-    q25 = sig_flow_lag.quantile(0.25)
-    q75 = sig_flow_lag.quantile(0.75)
-
-    regime_flow = pd.cut(
-        sig_flow_lag,
-        bins=[-np.inf, q25, q75, np.inf],
-        labels=['Heavy outflow', 'Neutral', 'Heavy inflow']
-    )
-
-    ret_by_flow = {}
-    for label in ['Heavy outflow', 'Neutral', 'Heavy inflow']:
-        mask = regime_flow == label
-        ann  = set_ret[mask].mean() * WEEKS_PER_YEAR
-        ret_by_flow[label] = ann
-        print(f'  {label:15s}: AnnRet = {ann:+.1%}  n={mask.sum()}')
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Cumulative foreign flow vs SET
-    ax1 = axes[0]
-    (sig_flow_z).plot(ax=ax1, color='steelblue', alpha=0.7)
-    ax1.axhline(0, color='black', lw=0.5)
-    ax1.set_title('Foreign Flow 13w Z-score')
-    ax1.set_ylabel('Z-score')
-
-    # Regime returns
-    labels = list(ret_by_flow.keys())
-    values = [ret_by_flow[l] for l in labels]
-    colors = ['#e74c3c' if v < 0 else '#2ecc71' for v in values]
-    axes[1].bar(labels, values, color=colors, alpha=0.8, edgecolor='white')
-    axes[1].set_title('SET Ann. Return by Foreign Flow Regime (1w forward, lag1)')
-    axes[1].set_ylabel('Annualised return')
-    axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
-    axes[1].axhline(0, color='black', lw=0.6)
-
-    plt.tight_layout()
-    plt.savefig(FIGS / 'nb22_flow_signal.png', bbox_inches='tight')
-    plt.show()
-"""))
-
-# ── 4. TFEX Put/Call Ratio ─────────────────────────────────────────────────────
+# ── 4. VIX Term Structure ─────────────────────────────────────────────────────
 cells.append(md("""
-    ## 4. Signal 3 — TFEX SET50 Put/Call Ratio
+    ## 4. Signal 3 — VIX Term Structure (VIX3M − VIX)
 
-    **Hypothesis (contrarian):** Extreme put buying → fear / over-hedging → rebound.
-    High PCR = investors buying lots of puts = oversold → contrarian buy signal.
+    **CBOE VIX** = implied vol of S&P500 at 30-day horizon.
+    **CBOE VIX3M** = implied vol at 3-month horizon.
 
-    **Feature:** PCR_OI Z-score (52-week rolling). High Z = contrarian long.
+    Normal market: VIX3M > VIX (term structure in contango → upward sloping).
+    Fear/stress:   VIX  > VIX3M (backwardation → flat/inverted → near-term panic).
+
+    > TFEX SET50 put/call ratio API is behind Incapsula WAF.
+    > VIX term structure is a global proxy for options market sentiment.
+
+    **Feature:** `vix_term = VIX3M − VIX`
+    - When vix_term < 0 (backwardation): near-term fear spike → contrarian buy
+    - When vix_term >> 0 (steep contango): complacency → caution
+
+    **Hypothesis (contrarian):** Extreme backwardation → over-hedging → rebound.
 """))
 
 cells.append(code("""\
-pcr_path = RAW / 'tfex_pcr.csv'
-has_pcr = pcr_path.exists()
-print(f'tfex_pcr.csv exists: {has_pcr}')
-if has_pcr:
-    pcr = pd.read_csv(pcr_path, parse_dates=['date'])
-    pcr = pcr.set_index('date').sort_index()
-    print(pcr.tail(3).to_string())
-    print(f'Rows: {len(pcr)}  '
-          f'{pcr.index[0].date()} -> {pcr.index[-1].date()}')
-    print(f'PCR_OI: mean={pcr["pcr_oi"].mean():.3f}  '
-          f'std={pcr["pcr_oi"].std():.3f}  '
-          f'range=[{pcr["pcr_oi"].min():.3f}, {pcr["pcr_oi"].max():.3f}]')
+print('Fetching ^VIX and ^VIX3M from Yahoo Finance...')
+vix_raw = yf.download(['^VIX', '^VIX3M'], start='2009-01-01', progress=False)
+
+def get_mc(df, ticker):
+    if isinstance(df.columns, pd.MultiIndex):
+        return df['Close'][ticker]
+    return df['Close']
+
+vix  = get_mc(vix_raw, '^VIX')
+vix3m = get_mc(vix_raw, '^VIX3M')
+
+print(f'^VIX  : {vix.dropna().shape[0]} days  '
+      f'{vix.dropna().index[0].date()} -> {vix.dropna().index[-1].date()}')
+print(f'^VIX3M: {vix3m.dropna().shape[0]} days  '
+      f'{vix3m.dropna().index[0].date()} -> {vix3m.dropna().index[-1].date()}')
+print()
+print('Latest values:')
+print(pd.DataFrame({'VIX': vix, 'VIX3M': vix3m}).tail(5).to_string())
 """))
 
 cells.append(code("""\
-if has_pcr:
-    # Weekly last observation
-    pcr_w = pcr[['pcr_oi', 'pcr_vol']].resample('W-FRI').last().ffill()
+# Weekly (end-of-week last obs)
+vix_w  = vix.resample('W-FRI').last()
+vix3m_w = vix3m.resample('W-FRI').last()
 
-    # Z-score (52-week rolling) — high Z = extreme puts = contrarian bullish
-    for col in ['pcr_oi', 'pcr_vol']:
-        roll = pcr_w[col].rolling(52)
-        pcr_w[col + '_z'] = (pcr_w[col] - roll.mean()) / (roll.std() + 1e-9)
+# VIX term structure: VIX3M - VIX
+# Positive = contango (normal), negative = backwardation (fear/stress)
+vix_term_w = vix3m_w - vix_w
 
-    print('TFEX PCR weekly (last 5):')
-    print(pcr_w.tail(5).to_string())
+# Z-score (52w rolling) — standardise across regimes
+roll52 = vix_term_w.rolling(52)
+vix_term_z = (vix_term_w - roll52.mean()) / (roll52.std() + 1e-9)
+
+# Also: VIX level z-score (standard fear gauge)
+roll52_vix = vix_w.rolling(52)
+vix_level_z = (vix_w - roll52_vix.mean()) / (roll52_vix.std() + 1e-9)
+
+# Align to SET index
+sig_vix_term   = vix_term_w.reindex(set_ret.index).ffill()
+sig_vix_term_z = vix_term_z.reindex(set_ret.index).ffill()
+sig_vix_lvl_z  = vix_level_z.reindex(set_ret.index).ffill()
+
+print('VIX term structure (last 5 weeks):')
+df_vix_preview = pd.DataFrame({
+    'VIX': vix_w, 'VIX3M': vix3m_w, 'term': vix_term_w, 'term_z': vix_term_z
+})
+print(df_vix_preview.tail(5).to_string())
+print()
+print('IC analysis — VIX term structure (contrarian):')
+# Note: for contrarian, we expect negative IC (high VIX/backwardation → SET goes UP)
+# so we test both raw and inverted
+ic_results.append(compute_ic(sig_vix_term,   set_ret, lag=1, label='VIX term (VIX3M−VIX) raw (lag1)'))
+ic_results.append(compute_ic(sig_vix_term_z, set_ret, lag=1, label='VIX term Z-score (lag1)'))
+ic_results.append(compute_ic(-sig_vix_lvl_z, set_ret, lag=1, label='VIX level Z-score INVERTED (lag1)'))
+ic_results.append(compute_ic(-sig_vix_term_z,set_ret, lag=1, label='VIX term Z-score INVERTED (lag1)'))
 """))
 
 cells.append(code("""\
-if has_pcr:
-    sig_pcr_z   = pcr_w['pcr_oi_z'].reindex(set_ret.index).ffill()
-    sig_pcr_vol = pcr_w['pcr_vol_z'].reindex(set_ret.index).ffill()
+# Regime: VIX term structure terciles
+sig_vix_lag = sig_vix_term_z.shift(1)
+q33, q67 = sig_vix_lag.quantile([0.33, 0.67])
+regime_vix = pd.cut(sig_vix_lag,
+                    bins=[-np.inf, q33, q67, np.inf],
+                    labels=['Backwardation (fear)', 'Normal', 'Deep contango (calm)'])
 
-    print('IC analysis — TFEX Put/Call ratio signals:')
-    ic_results.append(compute_ic(sig_pcr_z,   set_ret, lag=1, label='PCR OI Z-score (lag1)'))
-    ic_results.append(compute_ic(sig_pcr_vol,  set_ret, lag=1, label='PCR Vol Z-score (lag1)'))
-    ic_results.append(compute_ic(sig_pcr_z,   set_ret, lag=2, label='PCR OI Z-score (lag2)'))
-else:
-    print('No PCR data yet — run: python3 scripts/fetch_tfex_pcr.py')
-"""))
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-cells.append(code("""\
-if has_pcr:
-    sig_pcr_lag = sig_pcr_z.shift(1)
-    q25 = sig_pcr_lag.quantile(0.25)
-    q75 = sig_pcr_lag.quantile(0.75)
+sig_vix_term.plot(ax=axes[0], color='darkorange', alpha=0.8)
+axes[0].axhline(0, color='black', lw=0.8, ls='--')
+axes[0].fill_between(sig_vix_term.index, sig_vix_term, 0,
+                     where=(sig_vix_term < 0), color='#e74c3c', alpha=0.2, label='Backwardation')
+axes[0].set_title('VIX Term Structure (VIX3M − VIX)')
+axes[0].set_ylabel('Vol points')
+axes[0].legend(fontsize=8)
 
-    regime_pcr = pd.cut(
-        sig_pcr_lag,
-        bins=[-np.inf, q25, q75, np.inf],
-        labels=['Low PCR (complacent)', 'Normal', 'High PCR (fear)']
-    )
+ret_by_vix = {lbl: set_ret[regime_vix == lbl].mean() * WEEKS_PER_YEAR
+              for lbl in ['Backwardation (fear)', 'Normal', 'Deep contango (calm)']}
+for lbl, v in ret_by_vix.items():
+    print(f'  {lbl:25s}: AnnRet = {v:+.1%}  n={int((regime_vix==lbl).sum())}')
 
-    ret_by_pcr = {}
-    for label in ['Low PCR (complacent)', 'Normal', 'High PCR (fear)']:
-        mask = regime_pcr == label
-        ann  = set_ret[mask].mean() * WEEKS_PER_YEAR
-        ret_by_pcr[label] = ann
-        print(f'  {label:25s}: AnnRet = {ann:+.1%}  n={mask.sum()}')
+labels = list(ret_by_vix.keys())
+values = [ret_by_vix[l] for l in labels]
+colors = ['#e74c3c' if v < 0 else '#2ecc71' for v in values]
+axes[1].bar(labels, values, color=colors, alpha=0.8, edgecolor='white')
+axes[1].axhline(0, color='black', lw=0.6)
+axes[1].set_title('SET Ann. Return by VIX Term Structure Regime (lag1)')
+axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    sig_pcr_z.plot(ax=axes[0], color='darkorange', alpha=0.8)
-    axes[0].axhline(1.5, color='red', lw=0.8, ls='--', label='High fear zone')
-    axes[0].axhline(-1.5, color='green', lw=0.8, ls='--', label='Complacency zone')
-    axes[0].set_title('TFEX PCR OI Z-score (52w rolling)')
-    axes[0].legend(fontsize=8)
-
-    labels = list(ret_by_pcr.keys())
-    values = [ret_by_pcr[l] for l in labels]
-    colors = ['#e74c3c' if v < 0 else '#2ecc71' for v in values]
-    axes[1].bar(labels, values, color=colors, alpha=0.8, edgecolor='white')
-    axes[1].set_title('SET Ann. Return by PCR Regime (1w forward, lag1)')
-    axes[1].set_ylabel('Annualised return')
-    axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
-    axes[1].axhline(0, color='black', lw=0.6)
-
-    plt.tight_layout()
-    plt.savefig(FIGS / 'nb22_pcr_signal.png', bbox_inches='tight')
-    plt.show()
+plt.tight_layout()
+plt.savefig(FIGS / 'nb22_vix_term_signal.png', bbox_inches='tight')
+plt.show()
 """))
 
 # ── 5. IC Summary ─────────────────────────────────────────────────────────────
-cells.append(md("""
-    ## 5. IC Summary — All New Signals
-"""))
+cells.append(md("## 5. IC Summary — All New Signals"))
 
 cells.append(code("""\
-if ic_results:
-    ic_df = pd.DataFrame(ic_results).sort_values('IC', ascending=False)
-    print('\\n── IC Summary (Spearman rank correlation, lag1 unless noted) ──')
-    print(ic_df[['label', 'IC', 'p', 'stars', 'n']].to_string(index=False))
+ic_df = pd.DataFrame(ic_results).sort_values('IC', ascending=False)
+print('── IC Summary (Spearman rank IC, 1w forward SET return) ──')
+print(ic_df[['label', 'IC', 'p', 'stars', 'n']].to_string(index=False))
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    colors = ['#2ecc71' if ic > 0 else '#e74c3c' for ic in ic_df['IC']]
-    bars = ax.barh(ic_df['label'], ic_df['IC'], color=colors, alpha=0.8, edgecolor='white')
-    ax.axvline(0, color='black', lw=0.7)
-    ax.axvline( 0.05, color='green', lw=0.8, ls='--', alpha=0.5, label='IC = ±0.05')
-    ax.axvline(-0.05, color='green', lw=0.8, ls='--', alpha=0.5)
-    for bar, row in zip(bars, ic_df.itertuples()):
-        xpos = row.IC + (0.003 if row.IC >= 0 else -0.003)
-        ax.text(xpos, bar.get_y() + bar.get_height()/2,
-                f'{row.IC:+.3f}{row.stars}', va='center', fontsize=8,
-                ha='left' if row.IC >= 0 else 'right')
-    ax.set_title('Information Coefficient — New Signals vs 1w Forward SET Return')
-    ax.set_xlabel('Spearman IC')
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    plt.savefig(FIGS / 'nb22_ic_summary.png', bbox_inches='tight')
-    plt.show()
-else:
-    print('No IC results yet — fetch data first, then re-run.')
+threshold_line = 0.05
+fig, ax = plt.subplots(figsize=(11, 5))
+colors = ['#2ecc71' if abs(ic) >= threshold_line else '#95a5a6'
+          for ic in ic_df['IC']]
+bars = ax.barh(ic_df['label'], ic_df['IC'], color=colors, alpha=0.85, edgecolor='white')
+ax.axvline(0,  color='black', lw=0.7)
+ax.axvline( threshold_line, color='green', lw=0.9, ls='--', alpha=0.6, label=f'IC = ±{threshold_line}')
+ax.axvline(-threshold_line, color='green', lw=0.9, ls='--', alpha=0.6)
+for bar, row in zip(bars, ic_df.itertuples()):
+    xpos = row.IC + (0.002 if row.IC >= 0 else -0.002)
+    ax.text(xpos, bar.get_y() + bar.get_height()/2,
+            f'{row.IC:+.3f}{row.stars}', va='center', fontsize=7.5,
+            ha='left' if row.IC >= 0 else 'right')
+ax.set_title('Information Coefficient — New Signals vs 1w Forward SET Return')
+ax.set_xlabel('Spearman IC')
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(FIGS / 'nb22_ic_summary.png', bbox_inches='tight')
+plt.show()
 """))
 
 # ── 6. System Integration ──────────────────────────────────────────────────────
 cells.append(md("""
-    ## 6. System Integration
+    ## 6. System Integration — Layering on NB21 Baseline
 
-    Take the **best significant signal(s)** and layer them onto the NB21 baseline:
+    Take the **best significant signal(s)** and add position scaling on top of the NB21 system:
 
-    - If `|IC| ≥ 0.05` and `p < 0.10`: include signal
-    - Mechanism: **scale position** ±20% based on signal quintile
-      - Top quintile signal → position × 1.2
-      - Bottom quintile signal → position × 0.8
-      - Middle quintiles → position × 1.0
+    - **Inclusion rule**: `|IC| ≥ 0.05` AND `p < 0.10`
+    - **Mechanism**: composite rank of signals → ±20% position scale
+      - Top quintile → ×1.2 position
+      - Bottom quintile → ×0.8 position
+      - Middle quintiles → ×1.0
 
-    This is conservative: the new signal adjusts size, it does not flip direction.
+    This is conservative: new signals adjust size only, they do not flip direction.
 """))
 
 cells.append(code("""\
 # ── NB21 baseline system (replicated) ────────────────────────────────────────
-# EEM L/flat + Breadth filter + Risk Parity (SET+Gold) + Vol Target + DD Control
+WEEKS_PER_YEAR = 52
+RF_ANNUAL      = 0.02
 
-GOLD_TICKER = 'gold_ret_w'
-SET_TICKER  = 'SET_index_ret_w'
-
-gold_ret = df_base[GOLD_TICKER].reindex(set_ret.index)
+gold_ret_s = gold_ret.reindex(set_ret.index).fillna(0)
 eem_pos_base = (df_base['eem_ret_d_lag1'].shift(0) > 0).astype(float).fillna(0.5)
 
-# ── Risk Parity weights (52w rolling vol) ─────────────────────────────────────
+# Risk Parity weights (52w rolling vol)
 vol_set  = set_ret.rolling(12).std().shift(1) + 1e-6
-vol_gold = gold_ret.rolling(12).std().shift(1) + 1e-6
-inv_vol_set  = 1 / vol_set
-inv_vol_gold = 1 / vol_gold
-total_iv = inv_vol_set + inv_vol_gold
-w_set    = inv_vol_set  / total_iv
-w_gold   = inv_vol_gold / total_iv
+vol_gold = gold_ret_s.rolling(12).std().shift(1) + 1e-6
+w_set  = (1/vol_set)  / (1/vol_set + 1/vol_gold)
+w_gold = (1/vol_gold) / (1/vol_set + 1/vol_gold)
 
-# ── Blended return (risk parity) ──────────────────────────────────────────────
-rp_ret = w_set * set_ret + w_gold * gold_ret
+# EEM signal → set component
+set_sig_ret = eem_pos_base * set_ret
+rp_sig_ret  = w_set * set_sig_ret + w_gold * gold_ret_s
 
-# ── EEM signal applied to SET component only ──────────────────────────────────
-set_sig_ret  = eem_pos_base * set_ret
-rp_sig_ret   = w_set * set_sig_ret + w_gold * gold_ret
-
-# ── Vol targeting (10% annual) ────────────────────────────────────────────────
+# Vol targeting (10% annual)
 target_vol = 0.10 / np.sqrt(WEEKS_PER_YEAR)
 port_vol   = rp_sig_ret.rolling(12).std().shift(1)
 vt_scale   = (target_vol / (port_vol + 1e-9)).clip(0, 2)
 vt_ret     = vt_scale * rp_sig_ret
 
-# ── Drawdown control (-15% trigger) ───────────────────────────────────────────
-cum    = (1 + vt_ret.fillna(0)).cumprod()
-peak   = cum.expanding().max()
-dd     = (cum - peak) / peak
+# Drawdown control (−15% trigger)
+cum = (1 + vt_ret.fillna(0)).cumprod()
+peak = cum.expanding().max()
+dd   = (cum - peak) / peak
 dd_scale = pd.Series(1.0, index=vt_ret.index)
-in_dd  = False
+in_dd = False
 for i in range(1, len(dd)):
     if dd.iloc[i] < -0.15 and not in_dd:
         in_dd = True
@@ -509,19 +506,28 @@ print(f'NB21 Baseline — Sharpe: {sharpe(baseline_ret):.3f}  '
 """))
 
 cells.append(code("""\
-# ── Select signals with IC >= 0.05 and p < 0.10 ───────────────────────────────
+# ── Candidate signals — test lag1 and lag2 for each ──────────────────────────
+# IC testing above showed:
+#   THD z-score lag2 = IC +0.126 (***) — strongest signal
+#   THD z-score lag1 = IC +0.061 (*)
+#   THD 4w cumul lag1 = IC +0.075 (**)
+# Use lag2 for THD (stronger and more significant)
 sig_candidates = {}
 
-if has_bonds and 'sig_slope' in dir():
+# Signal 1: Thai yield slope lag1 (IC=0.033, not significant but include for test)
+if has_bonds and sig_slope is not None:
     sig_candidates['th_slope'] = sig_slope.shift(1)
 
-if has_flow and 'sig_flow_z' in dir():
-    sig_candidates['foreign_z'] = sig_flow_z.shift(1)
+# Signal 2: THD foreign demand — use lag2 (IC=0.126 ***)
+sig_candidates['thd_z_lag2'] = sig_thd_z.shift(2)
 
-if has_pcr and 'sig_pcr_z' in dir():
-    sig_candidates['pcr_z'] = sig_pcr_z.shift(1)  # contrarian: high PCR = bullish
+# Signal 2b: THD 4w cumul lag1 as alternative (IC=0.075 **)
+sig_candidates['thd_4w_lag1'] = sig_thd_4w.shift(1)
 
-# Filter by IC threshold
+# Signal 3: VIX term structure inverted (backwardation = bullish); IC was ~0 so will be skipped
+sig_candidates['vix_term_inv'] = (-sig_vix_term_z).shift(1)
+
+# Filter by IC threshold (IC >= 0.05 AND p < 0.10)
 sig_keep = {}
 for name, sig in sig_candidates.items():
     both = pd.concat([sig, set_ret], axis=1).dropna()
@@ -529,34 +535,25 @@ for name, sig in sig_candidates.items():
     r, p = stats.spearmanr(both['s'], both['r'])
     if abs(r) >= 0.05 and p < 0.10:
         sig_keep[name] = sig
-        print(f'  KEEP {name}: IC={r:+.3f}  p={p:.3f}')
+        print(f'  KEEP  {name}: IC={r:+.4f}  p={p:.3f}')
     else:
-        print(f'  SKIP {name}: IC={r:+.3f}  p={p:.3f} (below threshold)')
+        print(f'  SKIP  {name}: IC={r:+.4f}  p={p:.3f} (below threshold)')
 
-print(f'Signals kept for integration: {list(sig_keep.keys())}')
+print(f'Signals kept: {list(sig_keep.keys())}')
 """))
 
 cells.append(code("""\
-# ── Position scaling from signal composite ────────────────────────────────────
+# ── Position scaling from composite signal ────────────────────────────────────
 if sig_keep:
-    # Combine signals: rank each → average rank → quartile
-    sig_df = pd.DataFrame(sig_keep).reindex(baseline_ret.index)
-    sig_df = sig_df.fillna(method='ffill')
+    sig_df = pd.DataFrame(sig_keep).reindex(baseline_ret.index).ffill()
 
-    # For PCR: invert (high PCR = bullish)
-    if 'pcr_z' in sig_df.columns:
-        sig_df['pcr_z'] = -sig_df['pcr_z']
+    # Rank each signal 0→1, then average ranks
+    composite = sig_df.rank(pct=True).mean(axis=1)
 
-    # Rank 0-1 for each signal, average
-    ranked = sig_df.rank(pct=True)
-    composite = ranked.mean(axis=1)
-
-    # Scale: bottom 20% → 0.8x, top 20% → 1.2x, middle → 1.0x
     sig_scale = pd.Series(1.0, index=baseline_ret.index)
     sig_scale[composite >= 0.80] = 1.20
     sig_scale[composite <= 0.20] = 0.80
 
-    # Apply scaling (capped at vol-target cap of 2x, so effective cap is 2.4x total)
     enhanced_ret = sig_scale * baseline_ret
 
     print(f'NB22 Enhanced   — Sharpe: {sharpe(enhanced_ret):.3f}  '
@@ -569,36 +566,34 @@ if sig_keep:
           f'MaxDD: {max_dd(set_ret):.1%}  '
           f'Calmar: {calmar(set_ret):.2f}')
 else:
-    print('No signals met threshold — baseline unchanged.')
+    print('No signals met IC threshold — baseline unchanged.')
     enhanced_ret = baseline_ret
 """))
 
 cells.append(code("""\
-# ── Equity curve comparison ────────────────────────────────────────────────────
+# Equity curve comparison
 fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-cum_baseline = (1 + baseline_ret.fillna(0)).cumprod()
-cum_enhanced = (1 + enhanced_ret.fillna(0)).cumprod()
-cum_set      = (1 + set_ret.fillna(0)).cumprod()
+cum_base = (1 + baseline_ret.fillna(0)).cumprod()
+cum_enh  = (1 + enhanced_ret.fillna(0)).cumprod()
+cum_set  = (1 + set_ret.fillna(0)).cumprod()
 
 ax = axes[0]
-cum_enhanced.plot(ax=ax, label='NB22 Enhanced',  color='#2ecc71', lw=2)
-cum_baseline.plot(ax=ax, label='NB21 Baseline',   color='steelblue', lw=1.5, ls='--')
-cum_set.plot(     ax=ax, label='SET Buy & Hold',  color='grey', lw=1, alpha=0.6)
-ax.set_title('Equity Curve — NB22 vs NB21 Baseline vs SET B&H')
+cum_enh.plot( ax=ax, label='NB22 Enhanced', color='#2ecc71', lw=2)
+cum_base.plot(ax=ax, label='NB21 Baseline',  color='steelblue', lw=1.5, ls='--')
+cum_set.plot( ax=ax, label='SET B&H',         color='grey',      lw=1,   alpha=0.6)
+ax.set_title('Equity Curve — NB22 vs NB21 vs SET Buy & Hold')
 ax.set_ylabel('Cumulative return (×)')
 ax.legend(fontsize=9)
 ax.set_yscale('log')
 
-# Drawdown
 ax2 = axes[1]
-dd_enh  = (cum_enhanced - cum_enhanced.expanding().max()) / cum_enhanced.expanding().max()
-dd_base = (cum_baseline - cum_baseline.expanding().max()) / cum_baseline.expanding().max()
-dd_enh.plot( ax=ax2, label='NB22 Enhanced',  color='#2ecc71', lw=1.5)
-dd_base.plot(ax=ax2, label='NB21 Baseline',  color='steelblue', lw=1, ls='--')
+dd_enh  = (cum_enh  - cum_enh.expanding().max())  / cum_enh.expanding().max()
+dd_base = (cum_base - cum_base.expanding().max()) / cum_base.expanding().max()
+dd_enh.plot( ax=ax2, label='NB22 Enhanced', color='#2ecc71', lw=1.5)
+dd_base.plot(ax=ax2, label='NB21 Baseline', color='steelblue', lw=1, ls='--')
 ax2.fill_between(dd_enh.index, dd_enh, 0, alpha=0.15, color='#2ecc71')
 ax2.set_title('Drawdown')
-ax2.set_ylabel('Drawdown')
 ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0%}'))
 ax2.legend(fontsize=9)
 
@@ -607,29 +602,29 @@ plt.savefig(FIGS / 'nb22_equity_curve.png', bbox_inches='tight')
 plt.show()
 """))
 
-# ── 7. Summary Table ──────────────────────────────────────────────────────────
+# ── 7. Summary ─────────────────────────────────────────────────────────────────
 cells.append(md("## 7. Summary"))
 
 cells.append(code("""\
 summary = {
-    'SET Buy & Hold':  {'Sharpe': sharpe(set_ret),      'MaxDD': max_dd(set_ret),      'Calmar': calmar(set_ret)},
-    'NB21 Baseline':   {'Sharpe': sharpe(baseline_ret), 'MaxDD': max_dd(baseline_ret), 'Calmar': calmar(baseline_ret)},
-    'NB22 Enhanced':   {'Sharpe': sharpe(enhanced_ret), 'MaxDD': max_dd(enhanced_ret), 'Calmar': calmar(enhanced_ret)},
+    'SET Buy & Hold': {'Sharpe': sharpe(set_ret),      'MaxDD': max_dd(set_ret),      'Calmar': calmar(set_ret)},
+    'NB21 Baseline':  {'Sharpe': sharpe(baseline_ret), 'MaxDD': max_dd(baseline_ret), 'Calmar': calmar(baseline_ret)},
+    'NB22 Enhanced':  {'Sharpe': sharpe(enhanced_ret), 'MaxDD': max_dd(enhanced_ret), 'Calmar': calmar(enhanced_ret)},
 }
 
-summary_df = pd.DataFrame(summary).T
-summary_df['MaxDD'] = summary_df['MaxDD'].map('{:.1%}'.format)
-summary_df['Sharpe'] = summary_df['Sharpe'].map('{:.3f}'.format)
-summary_df['Calmar'] = summary_df['Calmar'].map('{:.2f}'.format)
-print(summary_df.to_string())
+sdf = pd.DataFrame(summary).T
+sdf['MaxDD']  = sdf['MaxDD'].map('{:.1%}'.format)
+sdf['Sharpe'] = sdf['Sharpe'].map('{:.3f}'.format)
+sdf['Calmar'] = sdf['Calmar'].map('{:.2f}'.format)
+print(sdf.to_string())
 
 print()
 print('Signals used:', list(sig_keep.keys()) if sig_keep else 'none (no signal met threshold)')
-if ic_results:
-    sig_ic = [(r['label'], r['IC'], r['p'], r['stars']) for r in ic_results]
-    print('IC results:')
-    for label, ic, p, stars in sorted(sig_ic, key=lambda x: -abs(x[1])):
-        print(f'  {label:40s}  IC={ic:+.4f}  p={p:.3f} {stars}')
+print()
+print('All IC results (sorted by |IC|):')
+ic_all = pd.DataFrame(ic_results).sort_values(by='IC', key=abs, ascending=False)
+for _, row in ic_all.iterrows():
+    print(f'  {row["label"]:45s}  IC={row["IC"]:+.4f}  p={row["p"]:.3f} {row["stars"]}')
 """))
 
 # ── Build notebook ─────────────────────────────────────────────────────────────
