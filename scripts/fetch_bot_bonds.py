@@ -1,26 +1,24 @@
 """
 fetch_bot_bonds.py — Thai government bond yields from Bank of Thailand
 
-Primary source : BOT Open API  (apiportal.bot.or.th)
-  → Register free at: https://apiportal.bot.or.th  (ต้องสมัครก่อน)
-  → After registration set env var:  BOT_API_KEY=<your_key>
-  → Or pass via:  python3 scripts/fetch_bot_bonds.py --key <your_key>
+Source  : BOT Open Data API  (gateway.api.bot.or.th)
+Register: https://portal.api.bot.or.th  (free account required)
+Auth    : Authorization: Bearer <token>  stored in .env as BOT_API_KEY
 
-Fallback source: BOT Excel download (bot.or.th direct file)
+Series (monthly, all T-Bill & Government Bond Yield):
+  FMRTINTM00030 = 1Y   FMRTINTM00031 = 2Y   FMRTINTM00032 = 3Y
+  FMRTINTM00034 = 5Y   FMRTINTM00036 = 7Y   FMRTINTM00039 = 10Y
 
 Output : data/raw/bot_bond_yields.csv
-Columns: date, yield_1y, yield_2y, yield_3y, yield_5y, yield_7y, yield_10y
+Columns: date (YYYY-MM-01), yield_1y, yield_2y, yield_3y, yield_5y, yield_7y, yield_10y
 
 Usage:
-  python3 scripts/fetch_bot_bonds.py                      # uses BOT_API_KEY env var
-  python3 scripts/fetch_bot_bonds.py --key <api_key>      # explicit key
-  python3 scripts/fetch_bot_bonds.py --year 2024          # single year only
-  python3 scripts/fetch_bot_bonds.py --test               # probe endpoints
-  python3 scripts/fetch_bot_bonds.py --test --key <key>   # test with your key
+  python3 scripts/fetch_bot_bonds.py           # full history (uses BOT_API_KEY from .env)
+  python3 scripts/fetch_bot_bonds.py --key <k> # explicit key
+  python3 scripts/fetch_bot_bonds.py --test    # quick test (3 months)
 """
 
 import argparse
-import io
 import os
 import time
 import warnings
@@ -30,204 +28,185 @@ import requests
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
+
+# Load .env automatically
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / '.env')
+except ImportError:
+    pass
 
 ROOT    = Path(__file__).parent.parent
 RAW_DIR = ROOT / 'data' / 'raw'
 RAW_DIR.mkdir(parents=True, exist_ok=True)
-
 OUT_PATH = RAW_DIR / 'bot_bond_yields.csv'
 
-# ── BOT Open API ──────────────────────────────────────────────────────────────
-# Register at: https://apiportal.bot.or.th  (free account required)
-# After login → My Apps → Subscribe to "BOT Statistical Data API"
-# Copy your API key (Client ID / Ocp-Apim-Subscription-Key)
-BOT_API_URL = 'https://apiportal.bot.or.th/bot/public/Stat-YieldCurve/v2/YIELD_CURVE'
+GW_BASE = 'https://gateway.api.bot.or.th'
 
-# ── BOT Excel fallback ────────────────────────────────────────────────────────
-# Historical bond yield Excel published by BOT Financial Statistics division
-BOT_EXCEL_URL = (
-    'https://www.bot.or.th/content/dam/bot/financial-statistics/'
-    'financial-markets/data/FM_BONDYIELD_EN.xlsx'
-)
-
-TENORS = [1, 2, 3, 5, 7, 10]  # years
+# T-Bill & Government Bond Yield series codes
+YIELD_SERIES = {
+    'yield_1y':  'FMRTINTM00030',
+    'yield_2y':  'FMRTINTM00031',
+    'yield_3y':  'FMRTINTM00032',
+    'yield_5y':  'FMRTINTM00034',
+    'yield_7y':  'FMRTINTM00036',
+    'yield_10y': 'FMRTINTM00039',
+}
 
 
-def fetch_via_bot_api(start: str, end: str, api_key: str = '') -> pd.DataFrame:
-    """
-    Fetch yield curve from BOT Open API.
-
-    api_key: from apiportal.bot.or.th → My Apps → Ocp-Apim-Subscription-Key
-    Returns DataFrame with columns: date, yield_1y ... yield_10y
-    Raises on failure.
-    """
-    params  = {'start_period': start, 'end_period': end}
-    headers = {'accept': 'application/json'}
-    if api_key:
-        headers['X-IBM-Client-Id']             = api_key
-        headers['Ocp-Apim-Subscription-Key']   = api_key
-    resp = requests.get(BOT_API_URL, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-
-    data = resp.json()
-    # Response structure: {"result": {"data": [{"period": "YYYY-MM-DD", "1": val, ...}]}}
-    if 'result' not in data or 'data' not in data['result']:
-        raise ValueError(f'Unexpected BOT API response structure: {list(data.keys())}')
-
-    records = []
-    for row in data['result']['data']:
-        rec = {'date': pd.to_datetime(row.get('period') or row.get('date'))}
-        for t in TENORS:
-            val = row.get(str(t)) or row.get(f'{t}Y') or row.get(f'yield_{t}y')
-            rec[f'yield_{t}y'] = float(val) if val is not None else np.nan
-        records.append(rec)
-
-    return pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+def _headers(api_key: str) -> dict:
+    return {'accept': 'application/json', 'Authorization': f'Bearer {api_key}'}
 
 
-def fetch_via_excel() -> pd.DataFrame:
-    """
-    Fallback: download BOT yield Excel, parse all tenor columns.
-    The Excel has columns like: Date, 1Y, 2Y, 3Y, 5Y, 7Y, 10Y, 15Y, 20Y
-    """
-    resp = requests.get(BOT_EXCEL_URL, timeout=60)
-    resp.raise_for_status()
-
-    xl = pd.read_excel(io.BytesIO(resp.content), sheet_name=0, header=0)
-    xl.columns = [str(c).strip() for c in xl.columns]
-
-    # Find date column (first column)
-    date_col = xl.columns[0]
-    xl = xl.rename(columns={date_col: 'date'})
-    xl['date'] = pd.to_datetime(xl['date'], errors='coerce')
-    xl = xl.dropna(subset=['date'])
-
-    # Map tenor columns
-    rename = {}
-    for t in TENORS:
-        for candidate in [str(t), f'{t}Y', f'{t}y', f'{t} Y', f'{t} yr']:
-            if candidate in xl.columns:
-                rename[candidate] = f'yield_{t}y'
-                break
-
-    xl = xl.rename(columns=rename)
-    keep = ['date'] + [f'yield_{t}y' for t in TENORS if f'yield_{t}y' in xl.columns]
-    return xl[keep].sort_values('date').reset_index(drop=True)
+def fetch_series(series_code: str, start: str, end: str, api_key: str) -> list[dict]:
+    """Fetch one series from /observations/. Returns list of {period_start, value}."""
+    r = requests.get(
+        f'{GW_BASE}/observations/',
+        headers=_headers(api_key),
+        params={'series_code': series_code, 'start_period': start, 'end_period': end},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    series_list = data.get('result', {}).get('series', [])
+    if not series_list:
+        return []
+    return series_list[0].get('observations', [])
 
 
-def fetch_bot_bonds(start_year: int = 2000, end_year: int = None,
+def fetch_series_chunked(series_code: str, start: str, end: str,
+                          api_key: str, chunk_years: int = 5) -> list[dict]:
+    """Fetch a series in year-by-year chunks to bypass the 120-record API limit."""
+    start_dt = pd.to_datetime(start)
+    end_dt   = pd.to_datetime(end)
+    all_obs  = []
+    current  = start_dt
+
+    while current <= end_dt:
+        chunk_end = min(current + pd.DateOffset(years=chunk_years) - pd.DateOffset(days=1), end_dt)
+        obs = fetch_series(series_code,
+                           current.strftime('%Y-%m-%d'),
+                           chunk_end.strftime('%Y-%m-%d'),
+                           api_key)
+        all_obs.extend(obs)
+        current = chunk_end + pd.DateOffset(days=1)
+        time.sleep(0.2)
+
+    # Deduplicate by period_start
+    seen = set()
+    unique = []
+    for o in all_obs:
+        if o['period_start'] not in seen:
+            seen.add(o['period_start'])
+            unique.append(o)
+    return unique
+
+
+def fetch_bot_bonds(start: str = '2000-01-01', end: str = None,
                     api_key: str = '') -> pd.DataFrame:
-    """Main fetch function: tries API first, falls back to Excel."""
-    if end_year is None:
-        end_year = datetime.today().year
+    if end is None:
+        end = datetime.today().strftime('%Y-%m-%d')
+    if not api_key:
+        raise ValueError(
+            'BOT_API_KEY not set.\n'
+            '  Register at: https://portal.api.bot.or.th\n'
+            '  Then add BOT_API_KEY=<token> to your .env file'
+        )
 
-    print('\n── Thai Bond Yields (Bank of Thailand) ─────────────────')
+    print('\n── Thai Bond Yields (Bank of Thailand API) ──────────────')
+    print(f'  Period: {start} → {end}')
 
-    # ── Try BOT API year-by-year ──────────────────────────────────────────────
-    all_frames = []
-    api_ok = False
-    if api_key:
-        print(f'  Using BOT API key: {api_key[:8]}…')
+    all_dfs = []
+    for col, code in YIELD_SERIES.items():
         try:
-            for yr in range(start_year, end_year + 1):
-                start = f'{yr}-01-01'
-                end   = f'{yr}-12-31'
-                df_yr = fetch_via_bot_api(start, end, api_key=api_key)
-                if not df_yr.empty:
-                    all_frames.append(df_yr)
-                    print(f'    {yr}: {len(df_yr):4d} rows', end='\r')
-                time.sleep(0.3)
-            api_ok = True
-            print(f'\n  BOT API OK — {sum(len(f) for f in all_frames)} rows total')
+            obs = fetch_series_chunked(code, start, end, api_key)
+            if not obs:
+                print(f'  {col}: no data')
+                continue
+            df_s = pd.DataFrame(obs)
+            df_s['date'] = pd.to_datetime(df_s['period_start'] + '-01')
+            df_s[col]    = pd.to_numeric(df_s['value'], errors='coerce')
+            all_dfs.append(df_s[['date', col]])
+            last_val = df_s[col].dropna().iloc[-1]
+            print(f'  {col}: {len(df_s):4d} months  '
+                  f'{df_s["date"].min().date()} → {df_s["date"].max().date()}  '
+                  f'latest={last_val:.3f}%')
         except Exception as e:
-            print(f'\n  BOT API failed: {e}')
-    else:
-        print('  No API key provided — skipping BOT API')
-        print('  → Register at: https://apiportal.bot.or.th')
-        print('  → Then run: python3 scripts/fetch_bot_bonds.py --key <your_key>')
+            print(f'  {col}: ERROR — {e}')
 
-    if not api_ok:
-        print('  Trying BOT Excel download …')
-        try:
-            df = fetch_via_excel()
-            print(f'  BOT Excel OK — {len(df)} rows  '
-                  f'{df["date"].min().date()} → {df["date"].max().date()}')
-            return df
-        except Exception as e:
-            print(f'  BOT Excel failed: {e}')
-            raise RuntimeError(
-                'Fetch failed.\n'
-                '  Option 1: Register at https://apiportal.bot.or.th and run with --key\n'
-                '  Option 2: Download FM_BONDYIELD_EN.xlsx from bot.or.th manually\n'
-                '            and place in data/raw/bot_bond_yields_raw.xlsx'
-            ) from e
+    if not all_dfs:
+        return pd.DataFrame()
 
-    df = pd.concat(all_frames, ignore_index=True).drop_duplicates('date')
+    # Merge all tenors on date
+    df = all_dfs[0]
+    for df_s in all_dfs[1:]:
+        df = df.merge(df_s, on='date', how='outer')
+
+    # Derived signal: yield slope (10Y - 1Y)
+    if 'yield_10y' in df.columns and 'yield_1y' in df.columns:
+        df['th_slope'] = df['yield_10y'] - df['yield_1y']
+
     return df.sort_values('date').reset_index(drop=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Fetch Thai government bond yields')
-    parser.add_argument('--key',  type=str, default='',
-                        help='BOT API key (or set env BOT_API_KEY)')
-    parser.add_argument('--year', type=int, help='Fetch single year only')
-    parser.add_argument('--test', action='store_true', help='Probe endpoints only')
+    parser.add_argument('--key',  type=str, default='', help='BOT API key (or set BOT_API_KEY in .env)')
+    parser.add_argument('--test', action='store_true',  help='Quick test: last 3 months only')
     args = parser.parse_args()
 
-    # API key: CLI arg > env var
     api_key = args.key or os.environ.get('BOT_API_KEY', '')
 
     print('=' * 60)
     print('fetch_bot_bonds.py — Thailand Economic Analysis')
     print(f'Output: {OUT_PATH}')
     if api_key:
-        print(f'API key: {api_key[:8]}… (set)')
+        print(f'API key: {api_key[:12]}… (set)')
     else:
-        print('API key: NOT SET  (register at https://apiportal.bot.or.th)')
+        print('ERROR: BOT_API_KEY not set')
+        print('  → Add BOT_API_KEY=<token> to .env')
+        return
     print('=' * 60)
 
     if args.test:
-        print('\nTesting BOT API …')
-        if not api_key:
-            print('  SKIP — no API key.  Pass --key <your_key> to test.')
-        else:
-            try:
-                sample = fetch_via_bot_api('2024-01-01', '2024-01-31', api_key=api_key)
-                print(f'  BOT API: OK  ({len(sample)} rows)')
-                print(sample.head(3).to_string(index=False))
-            except Exception as e:
-                print(f'  BOT API: FAIL — {e}')
-        print('\nTesting BOT Excel …')
-        try:
-            sample = fetch_via_excel()
-            print(f'  BOT Excel: OK  ({len(sample)} rows)')
-            print(sample.tail(3).to_string(index=False))
-        except Exception as e:
-            print(f'  BOT Excel: FAIL — {e}')
-        return
+        start = '2024-01-01'
+        end   = '2024-03-31'
+    else:
+        start = '2000-01-01'
+        end   = datetime.today().strftime('%Y-%m-%d')
 
-    start_year = args.year if args.year else 2000
-    end_year   = args.year if args.year else datetime.today().year
+        # Incremental: only fetch new months
+        if OUT_PATH.exists():
+            existing = pd.read_csv(OUT_PATH, parse_dates=['date'])
+            if not existing.empty:
+                last = existing['date'].max()
+                start = (last + pd.DateOffset(months=1)).strftime('%Y-%m-%d')
+                print(f'  Incremental update from {start}')
 
-    df = fetch_bot_bonds(start_year=start_year, end_year=end_year, api_key=api_key)
-    if df.empty:
+    df_new = fetch_bot_bonds(start=start, end=end, api_key=api_key)
+    if df_new.empty:
         print('No data retrieved.')
         return
 
-    if OUT_PATH.exists() and args.year:
-        existing = pd.read_csv(OUT_PATH, parse_dates=['date'])
-        df = pd.concat([existing, df], ignore_index=True).drop_duplicates('date')
-        df = df.sort_values('date').reset_index(drop=True)
+    if args.test:
+        print('\nSample data:')
+        print(df_new.to_string(index=False))
+        return
 
+    # Merge with existing
+    if OUT_PATH.exists():
+        existing = pd.read_csv(OUT_PATH, parse_dates=['date'])
+        df = pd.concat([existing, df_new], ignore_index=True).drop_duplicates('date')
+    else:
+        df = df_new
+
+    df = df.sort_values('date').reset_index(drop=True)
     df.to_csv(OUT_PATH, index=False)
+
     print(f'\n✓ Saved {len(df)} rows → {OUT_PATH}')
     print(f'  Date range: {df["date"].min().date()} → {df["date"].max().date()}')
-    for t in TENORS:
-        col = f'yield_{t}y'
-        if col in df.columns:
-            last = df[col].dropna().iloc[-1] if not df[col].dropna().empty else np.nan
-            print(f'  {t:2d}Y yield (latest): {last:.3f}%')
+    print(f'  Yield slope (latest): {df["th_slope"].dropna().iloc[-1]:+.2f}pp')
 
 
 if __name__ == '__main__':
